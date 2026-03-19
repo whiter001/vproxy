@@ -1,0 +1,24 @@
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Build artifacts
+proxy/http/1/proxy.1
+proxy/http/1/proxy.1.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+*.test
