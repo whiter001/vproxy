@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          bash scripts/fmt.sh
+          git diff --exit-code
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
+        include:
+          - target: windows-x86_64
+            os: windows-latest
+            bin_ext: .exe
+          - target: linux-x86_64
+            os: ubuntu-latest
+          - target: darwin-x86_64
+            os: macos-latest
+            vflags: -d cross_compile_macos_x86_64
+          - target: darwin-arm64
+            os: macos-latest
+            vflags: -d cross_compile_macos_arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      - name: Build proxy
+        shell: bash
+        env:
+          VFLAGS: ${{ matrix.vflags }}
+        run: |
+          mkdir -p ./bin
+          v -o ./bin/proxy.1${{ matrix.bin_ext }} proxy/http/1/proxy.1.v
+
+  test:
+    runs-on: ubuntu-latest
+    needs:
+      - format
+      - build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      - name: Run integration tests
+        shell: bash
+        run: bash proxy/http/1/test_full.sh

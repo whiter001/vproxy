@@ -19,6 +19,8 @@ mut:
 	active_conns i64
 }
 
+// 块作用：入口函数
+// 处理问题：初始化配置（环境变量）、建立监听、统计活跃连接、分发请求到协程
 fn main() {
 	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { default_listen_addr }
 	expected_auth := proxy_auth_value()
@@ -39,11 +41,13 @@ fn main() {
 			eprintln('Failed to accept client: ${err}')
 			continue
 		}
-		stdatomic.add_i64(&stats.active_conns, 1)
+		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
 		go handle_client(mut socket, stats, expected_auth)
 	}
 }
 
+// 块作用：认证值计算
+// 处理问题：支持 PROXY_AUTH_BASIC 或 (PROXY_AUTH_USER + PROXY_AUTH_PASS) 环境变量
 fn proxy_auth_value() string {
 	if basic := os.getenv_opt('PROXY_AUTH_BASIC') {
 		if basic != '' {
@@ -56,6 +60,12 @@ fn proxy_auth_value() string {
 	return base64.encode_str('${user}:${pass}')
 }
 
+// 块作用：客户端连接处理
+// 处理问题：
+// 1. 读取并解析 HTTP 头部
+// 2. 校验 Proxy Basic Auth（认证）
+// 3. 处理 CONNECT 隧道（HTTPS/TCP 代理）
+// 4. 处理普通 HTTP 转发及相关头部修改
 fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 	start := time.now()
 	defer {
@@ -99,8 +109,11 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 	mut host_header := ''
 
 	for line in header_lines {
+		if line == '' {
+			continue
+		}
 		lower := line.to_lower()
-		if lower.starts_with('proxy-authorization:') {
+		if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:') {
 			proxy_authorization = line.all_after(':').trim_space()
 		} else if lower.starts_with('host:') {
 			host_header = line.all_after(':').trim_space()
@@ -113,7 +126,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 		socket.write_string(response) or {}
 		return
 	}
-	provided_cred := proxy_authorization[6..].trim_space()
+	provided_cred := proxy_authorization[6..].trim_space().replace('\n', '').replace('\r',
+		'')
 	if provided_cred != expected_auth {
 		gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
 		response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
@@ -146,7 +160,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 
 	mut upstream := net.dial_tcp(upstream_host) or {
 		eprintln('Failed to connect to ${upstream_host}: ${err}')
-		send_simple_response(mut socket, '502 Bad Gateway', 'Upstream connection failed\n')
+		send_simple_response(mut socket, '502 Bad Gateway', 'Upstream connection failed: ${err}\n')
 		return
 	}
 	defer {
@@ -165,27 +179,21 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 		forwarded_headers << forwarded_first_line
 
 		mut has_host_header := false
-		mut content_length := 0
-		mut is_chunked := false
 		for i, line in header_str_lines {
 			if i == 0 {
-				continue // skip request line, already added as forwarded_first_line
+				continue // 忽略第一行（请求行），已在 forwarded_first_line 处理
 			}
 			if line == '' {
-				continue // skip empty lines from headers
+				continue // 忽略空行
 			}
 			lower := line.to_lower()
-			if lower.starts_with('proxy-authorization:') || lower.starts_with('proxy-connection:') {
+			// 移除代理相关的头部，防止循环代理或泄露验证信息
+			if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:')
+				|| lower.starts_with('proxy-connection:') {
 				continue
 			}
 			if lower.starts_with('host:') {
 				has_host_header = true
-			}
-			if lower.starts_with('content-length:') {
-				content_length = line.all_after(':').trim_space().int()
-			}
-			if lower.starts_with('transfer-encoding:') && lower.contains('chunked') {
-				is_chunked = true
 			}
 			forwarded_headers << line
 		}
@@ -201,38 +209,41 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 			return
 		}
 
-		// Forward request body if present
-		if is_chunked {
-			send_simple_response(mut socket, '501 Not Implemented', 'Chunked request body is not supported\n')
-			return
-		} else if content_length > 0 {
-			forward_request_body(mut socket, mut upstream, mut pending_body, content_length) or {
-				eprintln('Failed to forward request body: ${err}')
+		// --- 优化：流式转发 Body ---
+		// 不再区分 Content-Length 或 Chunked，
+		// 直接将之前读取 header 时多读到的 body 部分发送给上游，
+		// 剩余部分交给后续的双向 io.cp 透传。
+		if pending_body.len > 0 {
+			upstream.write(pending_body) or {
+				eprintln('Failed to forward pending body: ${err}')
 				return
 			}
 		}
 	}
 
-	// Bidirectional copy: spawn both directions
+	// 块作用：建立双向数据通道
+	// 处理问题：通过协程实现全双工通信，支持 CONNECT 隧道及普通 HTTP 的流式响应（含 Chunked）
 	if method == 'HEAD' {
-		// HEAD responses have no body, only copy upstream -> client
+		// HEAD 响应没有 body，仅单向复制响应头
 		io.cp(mut upstream, mut socket) or {}
 	} else {
 		mut wg := sync.new_waitgroup()
 		wg.add(2)
+		// 协程 1: 客户端 -> 上游
 		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 			defer {
 				src.close() or {}
-				wg.done()
 				dst.close() or {}
+				wg.done()
 			}
 			io.cp(mut src, mut dst) or {}
 		}(mut socket, mut upstream, mut wg)
+		// 协程 2: 上游 -> 客户端
 		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 			defer {
 				src.close() or {}
-				wg.done()
 				dst.close() or {}
+				wg.done()
 			}
 			io.cp(mut src, mut dst) or {}
 		}(mut upstream, mut socket, mut wg)
@@ -240,6 +251,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 	}
 }
 
+// 块作用：目标解析
+// 处理问题：从请求路径中提取 Host 和 Path，处理绝对 URL 和相对路径
 fn split_target(target string) (string, string) {
 	mut authority := ''
 	mut path := '/'
@@ -283,6 +296,8 @@ fn send_simple_response(mut socket net.TcpConn, status_line string, message stri
 	socket.write_string(response) or {}
 }
 
+// 块作用：读取头部原始字节
+// 处理问题：持续读取直至发现 \r\n\r\n 标志，限制头部最大长度 64KB
 fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 	mut data := []u8{}
 	mut buf := []u8{len: 8192}
@@ -297,6 +312,7 @@ fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 		}
 		header_end := find_header_end_from(data, if data.len > n + 3 { data.len - n - 3 } else { 0 })
 		if header_end >= 0 {
+			// 返回 (头部字节数组, 剩余已读取的 body 部分)
 			return data[..header_end], data[header_end + 4..]
 		}
 	}
@@ -315,25 +331,4 @@ fn find_header_end_from(data []u8, start int) int {
 		i++
 	}
 	return -1
-}
-
-fn forward_request_body(mut socket net.TcpConn, mut upstream net.TcpConn, mut pending_body []u8, content_length int) ! {
-	mut remaining := content_length
-	if pending_body.len > 0 {
-		take := if pending_body.len < remaining { pending_body.len } else { remaining }
-		if take > 0 {
-			upstream.write(pending_body[..take]) or { return err }
-			remaining -= take
-		}
-	}
-	mut buf := []u8{len: 4096}
-	for remaining > 0 {
-		read_size := if remaining < buf.len { remaining } else { buf.len }
-		n := socket.read(mut buf[..read_size]) or { return err }
-		if n <= 0 {
-			return error('Unexpected EOF while reading request body')
-		}
-		upstream.write(buf[..n]) or { return err }
-		remaining -= n
-	}
 }
