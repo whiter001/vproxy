@@ -222,15 +222,17 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 		wg.add(2)
 		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 			defer {
+				src.close() or {}
 				wg.done()
-				dst.close() or {} // Close destination to signal EOF or error
+				dst.close() or {}
 			}
 			io.cp(mut src, mut dst) or {}
 		}(mut socket, mut upstream, mut wg)
 		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 			defer {
+				src.close() or {}
 				wg.done()
-				dst.close() or {} // Close destination to signal EOF or error
+				dst.close() or {}
 			}
 			io.cp(mut src, mut dst) or {}
 		}(mut upstream, mut socket, mut wg)
@@ -283,7 +285,7 @@ fn send_simple_response(mut socket net.TcpConn, status_line string, message stri
 
 fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 	mut data := []u8{}
-	mut buf := []u8{len: 4096}
+	mut buf := []u8{len: 8192}
 	for {
 		n := socket.read(mut buf) or { return err }
 		if n <= 0 {
@@ -293,7 +295,7 @@ fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 		if data.len > 65536 {
 			return error('Request too large')
 		}
-		header_end := find_header_end(data)
+		header_end := find_header_end_from(data, if data.len > n + 3 { data.len - n - 3 } else { 0 })
 		if header_end >= 0 {
 			return data[..header_end], data[header_end + 4..]
 		}
@@ -301,14 +303,16 @@ fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 	return error('Bad request')
 }
 
-fn find_header_end(data []u8) int {
+fn find_header_end_from(data []u8, start int) int {
 	if data.len < 4 {
 		return -1
 	}
-	for i := 0; i + 3 < data.len; i++ {
+	mut i := if start > 0 { start } else { 0 }
+	for i + 3 < data.len {
 		if data[i] == `\r` && data[i + 1] == `\n` && data[i + 2] == `\r` && data[i + 3] == `\n` {
 			return i
 		}
+		i++
 	}
 	return -1
 }
