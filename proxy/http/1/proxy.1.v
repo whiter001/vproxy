@@ -5,6 +5,7 @@ import io
 import net
 import os
 import sync
+import sync.stdatomic
 import time
 
 const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
@@ -12,6 +13,11 @@ const connection_established = 'HTTP/1.1 200 Connection Established\r\n\r\n'
 const default_listen_addr = ':5777'
 const default_http_port = ':80'
 const default_https_port = ':443'
+
+struct Stats {
+mut:
+	active_conns i64
+}
 
 fn main() {
 	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { default_listen_addr }
@@ -27,14 +33,14 @@ fn main() {
 
 	eprintln('Listen on ${listen_addr} ...')
 
-	mut client_num := 0
+	stats := &Stats{}
 	for {
 		mut socket := server.accept() or {
 			eprintln('Failed to accept client: ${err}')
 			continue
 		}
-		client_num++
-		go handle_client(mut socket, client_num, expected_auth)
+		stdatomic.add_i64(&stats.active_conns, 1)
+		go handle_client(mut socket, stats, expected_auth)
 	}
 }
 
@@ -50,41 +56,20 @@ fn proxy_auth_value() string {
 	return base64.encode_str('${user}:${pass}')
 }
 
-fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
+fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 	start := time.now()
 	defer {
+		stdatomic.add_i64(&stats.active_conns, -1)
 		socket.close() or {}
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('${client_num} client handled in ${duration}s')
+		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
-	// Read raw socket to avoid buffered reader issues with request body
-	mut header_bytes := []u8{}
-	for {
-		mut buf := []u8{len: 1}
-		n := socket.read(mut buf) or {
-			send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-			return
-		}
-		if n == 0 {
-			send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-			return
-		}
-		header_bytes << buf[0]
-		// Check for end of headers (\r\n\r\n)
-		if header_bytes.len >= 4 {
-			end := header_bytes.len - 4
-			if header_bytes[end..].hex() == '0d0a0d0a' {
-				break
-			}
-		}
-		// Safety limit
-		if header_bytes.len > 65536 {
-			send_simple_response(mut socket, '400 Bad Request', 'Request too large\n')
-			return
-		}
+	header_bytes, mut pending_body := read_request_head(mut socket) or {
+		send_simple_response(mut socket, '400 Bad Request', '${err}\n')
+		return
 	}
 
 	header_str := header_bytes.bytestr()
@@ -181,6 +166,7 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 
 		mut has_host_header := false
 		mut content_length := 0
+		mut is_chunked := false
 		for i, line in header_str_lines {
 			if i == 0 {
 				continue // skip request line, already added as forwarded_first_line
@@ -198,6 +184,9 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 			if lower.starts_with('content-length:') {
 				content_length = line.all_after(':').trim_space().int()
 			}
+			if lower.starts_with('transfer-encoding:') && lower.contains('chunked') {
+				is_chunked = true
+			}
 			forwarded_headers << line
 		}
 		if !has_host_header && upstream_host != '' {
@@ -213,39 +202,37 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 		}
 
 		// Forward request body if present
-		if content_length > 0 {
-			mut body_buf := []u8{len: content_length}
-			mut total_read := 0
-			for total_read < content_length {
-				n := socket.read(mut body_buf[total_read..]) or { break }
-				if n == 0 {
-					break
-				}
-				total_read += n
-			}
-			if total_read > 0 {
-				upstream.write(body_buf[..total_read]) or {
-					eprintln('Failed to forward request body: ${err}')
-					return
-				}
+		if is_chunked {
+			send_simple_response(mut socket, '501 Not Implemented', 'Chunked request body is not supported\n')
+			return
+		} else if content_length > 0 {
+			forward_request_body(mut socket, mut upstream, mut pending_body, content_length) or {
+				eprintln('Failed to forward request body: ${err}')
+				return
 			}
 		}
 	}
 
-	// Bidirectional copy: spawn both directions, wait for both to complete
+	// Bidirectional copy: spawn both directions
 	if method == 'HEAD' {
 		// HEAD responses have no body, only copy upstream -> client
-		io.cp(mut upstream, mut socket) or { eprintln('Proxy copy failed: ${err}') }
+		io.cp(mut upstream, mut socket) or {}
 	} else {
 		mut wg := sync.new_waitgroup()
 		wg.add(2)
-		go fn (mut src io.Reader, mut dst io.Writer, mut wg sync.WaitGroup) {
-			io.cp(mut src, mut dst) or { eprintln('copy error: ${err}') }
-			wg.done()
+		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+			defer {
+				wg.done()
+				dst.close() or {} // Close destination to signal EOF or error
+			}
+			io.cp(mut src, mut dst) or {}
 		}(mut socket, mut upstream, mut wg)
-		go fn (mut src io.Reader, mut dst io.Writer, mut wg sync.WaitGroup) {
-			io.cp(mut src, mut dst) or { eprintln('copy error: ${err}') }
-			wg.done()
+		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+			defer {
+				wg.done()
+				dst.close() or {} // Close destination to signal EOF or error
+			}
+			io.cp(mut src, mut dst) or {}
 		}(mut upstream, mut socket, mut wg)
 		wg.wait()
 	}
@@ -292,4 +279,57 @@ fn send_simple_response(mut socket net.TcpConn, status_line string, message stri
 	body := message
 	response := 'HTTP/1.1 ${status_line}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.len}\r\n\r\n${body}'
 	socket.write_string(response) or {}
+}
+
+fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
+	mut data := []u8{}
+	mut buf := []u8{len: 4096}
+	for {
+		n := socket.read(mut buf) or { return err }
+		if n <= 0 {
+			return error('Bad request')
+		}
+		data << buf[..n]
+		if data.len > 65536 {
+			return error('Request too large')
+		}
+		header_end := find_header_end(data)
+		if header_end >= 0 {
+			return data[..header_end], data[header_end + 4..]
+		}
+	}
+	return error('Bad request')
+}
+
+fn find_header_end(data []u8) int {
+	if data.len < 4 {
+		return -1
+	}
+	for i := 0; i + 3 < data.len; i++ {
+		if data[i] == `\r` && data[i + 1] == `\n` && data[i + 2] == `\r` && data[i + 3] == `\n` {
+			return i
+		}
+	}
+	return -1
+}
+
+fn forward_request_body(mut socket net.TcpConn, mut upstream net.TcpConn, mut pending_body []u8, content_length int) ! {
+	mut remaining := content_length
+	if pending_body.len > 0 {
+		take := if pending_body.len < remaining { pending_body.len } else { remaining }
+		if take > 0 {
+			upstream.write(pending_body[..take]) or { return err }
+			remaining -= take
+		}
+	}
+	mut buf := []u8{len: 4096}
+	for remaining > 0 {
+		read_size := if remaining < buf.len { remaining } else { buf.len }
+		n := socket.read(mut buf[..read_size]) or { return err }
+		if n <= 0 {
+			return error('Unexpected EOF while reading request body')
+		}
+		upstream.write(buf[..n]) or { return err }
+		remaining -= n
+	}
 }
