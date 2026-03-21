@@ -4,10 +4,11 @@ import encoding.base64
 import io
 import net
 import os
+import sync
 import time
 
-const valid_methods = ['CONNECT', 'POST', 'GET', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
-const connection_established = 'HTTP/1.1 200 Connection established\r\nConnection: close\r\n\r\n'
+const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
+const connection_established = 'HTTP/1.1 200 Connection Established\r\n\r\n'
 const default_listen_addr = ':5777'
 const default_http_port = ':80'
 const default_https_port = ':443'
@@ -52,22 +53,42 @@ fn proxy_auth_value() string {
 fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 	start := time.now()
 	defer {
+		socket.close() or {}
+	}
+	defer {
 		duration := time.since(start)
 		eprintln('${client_num} client handled in ${duration}s')
 	}
-	defer {
-		socket.close() or {}
+
+	// Read raw socket to avoid buffered reader issues with request body
+	mut header_bytes := []u8{}
+	for {
+		mut buf := []u8{len: 1}
+		n := socket.read(mut buf) or {
+			send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
+			return
+		}
+		if n == 0 {
+			send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
+			return
+		}
+		header_bytes << buf[0]
+		// Check for end of headers (\r\n\r\n)
+		if header_bytes.len >= 4 {
+			end := header_bytes.len - 4
+			if header_bytes[end..].hex() == '0d0a0d0a' {
+				break
+			}
+		}
+		// Safety limit
+		if header_bytes.len > 65536 {
+			send_simple_response(mut socket, '400 Bad Request', 'Request too large\n')
+			return
+		}
 	}
 
-	mut reader := io.new_buffered_reader(reader: socket)
-	defer {
-		reader.free()
-	}
-
-	first_line := reader.read_line() or {
-		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-		return
-	}
+	header_str := header_bytes.bytestr()
+	first_line := header_str.all_before('\r\n')
 	if first_line == '' {
 		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
 		return
@@ -88,30 +109,27 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 	target := first_parts[1]
 	version := first_parts[2]
 
-	mut header_lines := []string{cap: 16}
-	header_lines << first_line
+	header_lines := header_str.split('\r\n')
 	mut proxy_authorization := ''
 	mut host_header := ''
 
-	for {
-		line := reader.read_line() or {
-			send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-			return
-		}
-		if line == '' {
-			break
-		}
-
+	for line in header_lines {
 		lower := line.to_lower()
 		if lower.starts_with('proxy-authorization:') {
 			proxy_authorization = line.all_after(':').trim_space()
 		} else if lower.starts_with('host:') {
 			host_header = line.all_after(':').trim_space()
 		}
-		header_lines << line
 	}
 
-	if proxy_authorization != 'Basic ${expected_auth}' {
+	if !proxy_authorization.starts_with('Basic ') {
+		gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
+		response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+		socket.write_string(response) or {}
+		return
+	}
+	provided_cred := proxy_authorization[6..].trim_space()
+	if provided_cred != expected_auth {
 		gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
 		response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
 		socket.write_string(response) or {}
@@ -156,11 +174,20 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 			return
 		}
 	} else {
-		mut forwarded_headers := []string{cap: header_lines.len + 1}
+		// Parse headers from header_str
+		header_str_lines := header_str.split('\r\n')
+		mut forwarded_headers := []string{}
 		forwarded_headers << forwarded_first_line
 
 		mut has_host_header := false
-		for line in header_lines[1..] {
+		mut content_length := 0
+		for i, line in header_str_lines {
+			if i == 0 {
+				continue // skip request line, already added as forwarded_first_line
+			}
+			if line == '' {
+				continue // skip empty lines from headers
+			}
 			lower := line.to_lower()
 			if lower.starts_with('proxy-authorization:') || lower.starts_with('proxy-connection:') {
 				continue
@@ -168,21 +195,60 @@ fn handle_client(mut socket net.TcpConn, client_num int, expected_auth string) {
 			if lower.starts_with('host:') {
 				has_host_header = true
 			}
+			if lower.starts_with('content-length:') {
+				content_length = line.all_after(':').trim_space().int()
+			}
 			forwarded_headers << line
 		}
 		if !has_host_header && upstream_host != '' {
 			forwarded_headers << 'Host: ${upstream_host}'
 		}
+		forwarded_headers << 'Via: 1.1 v-proxy'
+		forwarded_headers << 'Proxy-Agent: V-Proxy/1.0'
 		forwarded_headers << ''
 		request_blob := forwarded_headers.join('\r\n') + '\r\n'
 		upstream.write_string(request_blob) or {
 			eprintln('Failed to forward request: ${err}')
 			return
 		}
+
+		// Forward request body if present
+		if content_length > 0 {
+			mut body_buf := []u8{len: content_length}
+			mut total_read := 0
+			for total_read < content_length {
+				n := socket.read(mut body_buf[total_read..]) or { break }
+				if n == 0 {
+					break
+				}
+				total_read += n
+			}
+			if total_read > 0 {
+				upstream.write(body_buf[..total_read]) or {
+					eprintln('Failed to forward request body: ${err}')
+					return
+				}
+			}
+		}
 	}
 
-	go io.cp(mut upstream, mut socket)
-	io.cp(mut socket, mut upstream) or { eprintln('Proxy copy failed: ${err}') }
+	// Bidirectional copy: spawn both directions, wait for both to complete
+	if method == 'HEAD' {
+		// HEAD responses have no body, only copy upstream -> client
+		io.cp(mut upstream, mut socket) or { eprintln('Proxy copy failed: ${err}') }
+	} else {
+		mut wg := sync.new_waitgroup()
+		wg.add(2)
+		go fn (mut src io.Reader, mut dst io.Writer, mut wg sync.WaitGroup) {
+			io.cp(mut src, mut dst) or { eprintln('copy error: ${err}') }
+			wg.done()
+		}(mut socket, mut upstream, mut wg)
+		go fn (mut src io.Reader, mut dst io.Writer, mut wg sync.WaitGroup) {
+			io.cp(mut src, mut dst) or { eprintln('copy error: ${err}') }
+			wg.done()
+		}(mut upstream, mut socket, mut wg)
+		wg.wait()
+	}
 }
 
 fn split_target(target string) (string, string) {
