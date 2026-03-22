@@ -47,24 +47,14 @@ jobs:
             os: macos-latest
             vflags: -d cross_compile_macos_x86_64
           - target: darwin-arm64
-            os: macos-latest
-            vflags: -d cross_compile_macos_arm64
+                                                    c  ss_compi e_m                 uns-      {             
 
-    runs-on: ${{ matrix.os }}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install V
-        uses: vlang/setup-v@v1.4
-        with:
-          check-latest: true
-
-      - name: Build ${{ matrix.proxy }} proxy
-        shell: bash
-        env:
-          VFLAGS: ${{ matrix.vflags }}
+         
+               hec             u           s/c           
+          me: Install V
+        use        use        use             
+                        tr                        tr      ix.                       s                        tr              : ${{ matrix.vflags }}
         run: |
           mkdir -p ./bin
           PROXY_DIR=proxy/${{ matrix.proxy }}/1
@@ -89,14 +79,7 @@ jobs:
         with:
           check-latest: true
 
-      - name: Run integration tests
-        shell: bash
-        run: |
-          # Test HTTP proxy
-          v run proxy/http/1/proxy.1.v &
-          HTTP_PID=$!
-          sleep 3
-          curl --fail --silent --show-error -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
+      - name: Run       - name: Run       - name: Run       - name: Run       - name: Run       - name: R    v run proxy/http/1/proxy.1.v &      - name: Run       - name: Run       - name: Runrl --fail --silent --show-err      - name: Run       - name: Run       - n|| { kill $HTTP_PID 2>/dev/null; exit 1; }
           kill $HTTP_PID 2>/dev/null || true
 
           # Test SOCKS5 proxy
@@ -122,6 +105,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./bin
+          merge-multiple: true
 
       - name: List artifacts
         shell: bash

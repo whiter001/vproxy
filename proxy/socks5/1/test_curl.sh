@@ -29,7 +29,7 @@ echo " PASS"
 # Test 3: With auth - HTTPS
 echo "[3/4] Test HTTPS (with auth)..."
 curl --fail --silent --show-error \
-  --socks5-user "${PROXY_USER}:${PROXY_PASS}" \
+  --proxy-user "${PROXY_USER}:${PROXY_PASS}" \
   --socks5 "${PROXY_ADDR}" \
   https://httpbin.org/get
 echo " PASS"
@@ -37,7 +37,7 @@ echo " PASS"
 # Test 4: With auth - HTTP
 echo "[4/4] Test HTTP (with auth)..."
 curl --fail --silent --show-error \
-  --socks5-user "${PROXY_USER}:${PROXY_PASS}" \
+  --proxy-user "${PROXY_USER}:${PROXY_PASS}" \
   --socks5 "${PROXY_ADDR}" \
   http://httpbin.org/ip
 echo " PASS"
