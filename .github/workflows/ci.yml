@@ -85,4 +85,5 @@ jobs:
 
       - name: Run integration tests
         shell: bash
-        run: bash proxy/http/1/test_full.sh
+        run: bash test_full.sh
+        working-directory: proxy/http/1
