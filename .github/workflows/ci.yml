@@ -38,6 +38,10 @@ jobs:
         proxy: [http, socks5]
         target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
         include:
+          - proxy: http
+            src: proxy/http/1/proxy.1.v
+          - proxy: socks5
+            src: proxy/socks5/1/proxy.socks5.v
           - target: windows-x86_64
             os: windows-latest
             bin_ext: .exe
@@ -67,8 +71,7 @@ jobs:
           VFLAGS: ${{ matrix.vflags }}
         run: |
           mkdir -p ./bin
-          PROXY_DIR=proxy/${{ matrix.proxy }}/1
-          v -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${PROXY_DIR}/proxy.${{ matrix.proxy }}.v
+          v -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${{ matrix.src }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -92,11 +95,14 @@ jobs:
       - name: Run integration tests
         shell: bash
         run: |
+          PROXY_USER=user
+          PROXY_PASS=pwd
+
           # Test HTTP proxy
           v run proxy/http/1/proxy.1.v &
           HTTP_PID=$!
           sleep 3
-          curl --fail --silent --show-error -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
+          curl --fail --silent --show-error --proxy-user "${PROXY_USER}:${PROXY_PASS}" -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
           kill $HTTP_PID 2>/dev/null || true
 
           # Test SOCKS5 proxy
