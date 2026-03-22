@@ -31,10 +31,11 @@ jobs:
           bash scripts/fmt.sh
           git diff --exit-code
 
-  build-http:
+  build:
     strategy:
       fail-fast: false
       matrix:
+        proxy: [http, socks5]
         target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
         include:
           - target: windows-x86_64
@@ -60,57 +61,24 @@ jobs:
         with:
           check-latest: true
 
-      - name: Build HTTP proxy
+      - name: Build ${{ matrix.proxy }} proxy
         shell: bash
         env:
           VFLAGS: ${{ matrix.vflags }}
         run: |
           mkdir -p ./bin
-          v -o ./bin/proxy.http.1${{ matrix.bin_ext }} proxy/http/1/proxy.1.v
+          PROXY_DIR=proxy/${{ matrix.proxy }}/1
+          v -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${PROXY_DIR}/proxy.${{ matrix.proxy }}.v
 
-  build-socks5:
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
-        include:
-          - target: windows-x86_64
-            os: windows-latest
-            bin_ext: .exe
-          - target: linux-x86_64
-            os: ubuntu-latest
-          - target: darwin-x86_64
-            os: macos-latest
-            vflags: -d cross_compile_macos_x86_64
-          - target: darwin-arm64
-            os: macos-latest
-            vflags: -d cross_compile_macos_arm64
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install V
-        uses: vlang/setup-v@v1.4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          check-latest: true
-
-      - name: Build SOCKS5 proxy
-        shell: bash
-        env:
-          VFLAGS: ${{ matrix.vflags }}
-        run: |
-          mkdir -p ./bin
-          v -o ./bin/proxy.socks5.1${{ matrix.bin_ext }} proxy/socks5/1/proxy.socks5.v
+          name: ${{ matrix.proxy }}-${{ matrix.target }}
+          path: bin/*
 
   test:
     runs-on: ubuntu-latest
-    needs:
-      - format
-      - build-http
-      - build-socks5
+    needs: format
 
     steps:
       - name: Checkout
@@ -127,20 +95,20 @@ jobs:
           # Test HTTP proxy
           v run proxy/http/1/proxy.1.v &
           HTTP_PID=$!
-          sleep 2
-          curl --fail --silent --show-error -x 127.0.0.1:5777 https://httpbin.org/get
+          sleep 3
+          curl --fail --silent --show-error -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
           kill $HTTP_PID 2>/dev/null || true
 
           # Test SOCKS5 proxy
           v run proxy/socks5/1/proxy.socks5.v &
           SOCKS5_PID=$!
-          sleep 2
-          curl --fail --silent --show-error --socks5 127.0.0.1:5778 https://httpbin.org/get
+          sleep 3
+          curl --fail --silent --show-error --socks5 127.0.0.1:5778 https://httpbin.org/get || { kill $SOCKS5_PID 2>/dev/null; exit 1; }
           kill $SOCKS5_PID 2>/dev/null || true
 
   release:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
@@ -150,46 +118,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install V
-        uses: vlang/setup-v@v1.4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          check-latest: true
+          path: ./bin
 
-      - name: Set up artifacts
+      - name: List artifacts
         shell: bash
-        run: |
-          mkdir -p ./bin
-
-          # Linux
-          v -o ./bin/proxy.http.linux-x86_64 proxy/http/1/proxy.1.v
-          v -o ./bin/proxy.socks5.linux-x86_64 proxy/socks5/1/proxy.socks5.v
-
-          # macOS x86_64
-          v -d cross_compile_macos_x86_64 -o ./bin/proxy.http.darwin-x86_64 proxy/http/1/proxy.1.v
-          v -d cross_compile_macos_x86_64 -o ./bin/proxy.socks5.darwin-x86_64 proxy/socks5/1/proxy.socks5.v
-
-          # macOS arm64
-          v -d cross_compile_macos_arm64 -o ./bin/proxy.http.darwin-arm64 proxy/http/1/proxy.1.v
-          v -d cross_compile_macos_arm64 -o ./bin/proxy.socks5.darwin-arm64 proxy/socks5/1/proxy.socks5.v
-
-          # Windows
-          v -o ./bin/proxy.http.windows-x86_64.exe proxy/http/1/proxy.1.v
-          v -o ./bin/proxy.socks5.windows-x86_64.exe proxy/socks5/1/proxy.socks5.v
-
-          ls -la ./bin/
+        run: ls -laR ./bin/
 
       - name: Generate checksums
         shell: bash
         run: |
           cd ./bin
-          sha256sum * > SHA256SUMS
+          find . -type f -exec sha256sum {} \; > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            bin/*
+            bin/**
           generate_release_notes: true
           name: v${{ github.run_number }}
           draft: false
