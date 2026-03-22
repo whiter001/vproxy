@@ -313,7 +313,5 @@ fn send_reply(mut socket net.TcpConn, rep u8, bind_addr string, bind_port u16) {
 	reply[8] = u8(bind_port >> 8)
 	reply[9] = u8(bind_port & 0xff)
 
-	socket.write(reply) or {
-		eprintln('Failed to send reply: ${err}')
-	}
+	socket.write(reply) or { eprintln('Failed to send reply: ${err}') }
 }
