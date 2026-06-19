@@ -30,6 +30,17 @@ mut:
 	active_conns i64
 }
 
+// 块作用：根据 atyp 构造 dial 地址字符串
+// 处理问题（issue #3）：IPv6 必须用方括号包裹，否则 port 段会被吃进 host。
+//   getaddrinfo 接受 `2001:db8::1` 与 `::1:80` 等无括号写法，但严格客户端
+//   可能拒绝；用 `[ipv6]:port` 是最稳的形式。
+fn dial_addr(target_host string, target_port u16, atyp u8) string {
+	if atyp == socks5_atyp_ipv6 {
+		return '[${target_host}]:${target_port}'
+	}
+	return '${target_host}:${target_port}'
+}
+
 fn main() {
 	listen_addr := os.getenv_opt('SOCKS5_LISTEN_ADDR') or { default_listen_addr }
 
@@ -187,20 +198,27 @@ fn handle_request(mut socket net.TcpConn) {
 	mut header := []u8{len: 4}
 	n := socket.read(mut header) or {
 		eprintln('Failed to read request header: ${err}')
-		send_reply(mut socket, socks5_rep_server_failure, '', 0)
+		send_reply(mut socket, socks5_rep_server_failure, socks5_atyp_ipv4, 0)
 		return
 	}
 	if n < 4 {
-		send_reply(mut socket, socks5_rep_server_failure, '', 0)
+		send_reply(mut socket, socks5_rep_server_failure, socks5_atyp_ipv4, 0)
 		return
 	}
 
 	ver := header[0]
 	cmd := header[1]
+	rsv := header[2]
 	atyp := header[3]
 
 	if ver != socks5_version {
-		send_reply(mut socket, socks5_rep_server_failure, '', 0)
+		send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+		return
+	}
+	// RFC 1928 §4: RSV MUST be 0x00. 拒绝非零请求可避免畸形客户端绕过处理。
+	if rsv != 0 {
+		eprintln('Invalid RSV: ${rsv}')
+		send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
 		return
 	}
 
@@ -230,9 +248,11 @@ fn handle_request(mut socket net.TcpConn) {
 			mut addr := []u8{len: 16}
 			socket.read(mut addr) or {}
 			mut parts := []string{len: 8}
+			// issue #3: hex() 会去前导 0，拼接成 `2001:db8:0:0:...:1` 这种带零段的串
+			// 在某些严格客户端会被拒绝。hex_full() 固定 4 位零填充，得到 RFC 5952 标准形式。
 			for i := 0; i < 8; i++ {
 				val := (u16(addr[i * 2]) << 8) | u16(addr[i * 2 + 1])
-				parts[i] = val.hex()
+				parts[i] = val.hex_full()
 			}
 			target_host = parts.join(':')
 			mut port := []u8{len: 2}
@@ -240,32 +260,35 @@ fn handle_request(mut socket net.TcpConn) {
 			target_port = (u16(port[0]) << 8) | u16(port[1])
 		}
 		else {
-			send_reply(mut socket, socks5_rep_address_not_supported, '', 0)
+			send_reply(mut socket, socks5_rep_address_not_supported, atyp, 0)
 			return
 		}
 	}
 
 	match cmd {
 		socks5_cmd_connect {
-			handle_connect(mut socket, target_host, target_port)
+			handle_connect(mut socket, target_host, target_port, atyp)
 		}
 		else {
-			send_reply(mut socket, socks5_rep_command_not_supported, '', 0)
+			// BIND / UDP ASSOCIATE 当前未实现（README 已说明）。
+			send_reply(mut socket, socks5_rep_command_not_supported, atyp, 0)
 		}
 	}
 }
 
-fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16) {
-	mut upstream := net.dial_tcp('${target_host}:${target_port}') or {
-		eprintln('Failed to connect to ${target_host}:${target_port}: ${err}')
-		send_reply(mut socket, socks5_rep_connection_refused, '', 0)
+fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, atyp u8) {
+	addr_str := dial_addr(target_host, target_port, atyp)
+	mut upstream := net.dial_tcp(addr_str) or {
+		eprintln('Failed to connect to ${addr_str}: ${err}')
+		send_reply(mut socket, socks5_rep_connection_refused, atyp, 0)
 		return
 	}
 	defer {
 		upstream.close() or {}
 	}
 
-	send_reply(mut socket, socks5_rep_success, '0.0.0.0', 0)
+	// 回写成功 reply，回包 ATYP 与请求一致（RFC 1928 §6）。
+	send_reply(mut socket, socks5_rep_success, atyp, 0)
 
 	mut wg := sync.new_waitgroup()
 	wg.add(2)
@@ -291,27 +314,41 @@ fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16) {
 	wg.wait()
 }
 
-fn send_reply(mut socket net.TcpConn, rep u8, bind_addr string, bind_port u16) {
-	mut reply := []u8{len: 10}
-	reply[0] = socks5_version
-	reply[1] = rep
-	reply[2] = 0
-	reply[3] = socks5_atyp_ipv4
+// 块作用：发送 SOCKS5 reply
+// 处理问题（issue #3）：
+// 1. 按请求 ATYP 输出对应长度的包（IPv4=10 字节 / IPv6=22 字节 / domain=变长）
+// 2. BND.ADDR 始终为 0（IPv4: 0.0.0.0 / IPv6: :: / domain: 空），BND.PORT 为 0
+// 3. 大多数 SOCKS5 客户端忽略 BND.ADDR，但严格客户端（如 curl）会校验包长度
+fn send_reply(mut socket net.TcpConn, rep u8, req_atyp u8, bind_port u16) {
+	mut reply := []u8{}
+	reply << socks5_version
+	reply << rep
+	reply << u8(0) // RSV
+	reply << req_atyp
 
-	addr_parts := bind_addr.split('.')
-	if addr_parts.len == 4 {
-		for i, part in addr_parts {
-			reply[4 + i] = u8(part.int())
+	match req_atyp {
+		socks5_atyp_ipv4 {
+			reply << []u8{len: 4} // BND.ADDR = 0.0.0.0
+			reply << u8(bind_port >> 8)
+			reply << u8(bind_port & 0xff)
 		}
-	} else {
-		reply[4] = 0
-		reply[5] = 0
-		reply[6] = 0
-		reply[7] = 0
+		socks5_atyp_ipv6 {
+			reply << []u8{len: 16} // BND.ADDR = ::
+			reply << u8(bind_port >> 8)
+			reply << u8(bind_port & 0xff)
+		}
+		socks5_atyp_domain {
+			reply << u8(0) // BND.ADDR length = 0
+			reply << u8(bind_port >> 8)
+			reply << u8(bind_port & 0xff)
+		}
+		else {
+			// 未知 atyp：回 IPv4 全 0，避免写错字节长度。
+			reply << []u8{len: 4}
+			reply << u8(bind_port >> 8)
+			reply << u8(bind_port & 0xff)
+		}
 	}
-
-	reply[8] = u8(bind_port >> 8)
-	reply[9] = u8(bind_port & 0xff)
 
 	socket.write(reply) or { eprintln('Failed to send reply: ${err}') }
 }
