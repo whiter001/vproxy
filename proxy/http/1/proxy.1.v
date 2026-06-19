@@ -2,6 +2,7 @@ module main
 
 import encoding.base64
 import io
+import lifecycle
 import net
 import os
 import sync
@@ -10,19 +11,21 @@ import time
 
 const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
 const connection_established = 'HTTP/1.1 200 Connection Established\r\n\r\n'
-const default_listen_addr = ':5777'
 const default_http_port = ':80'
 const default_https_port = ':443'
 
 struct Stats {
 mut:
 	active_conns i64
+	inflight     sync.WaitGroup // 跟踪在飞连接，用于优雅退出（issue #5）
 }
 
 // 块作用：入口函数
-// 处理问题：初始化配置（环境变量）、建立监听、统计活跃连接、分发请求到协程
+// 处理问题：
+// - issue #1：PROXY_REQUIRE_AUTH=0 / fail-fast 配置
+// - issue #5：SIGINT/SIGTERM 优雅退出 + idle timeout
 fn main() {
-	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { default_listen_addr }
+	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { ':5777' }
 	expected_auth, require_auth := proxy_auth_config() or {
 		eprintln('Error: ${err}')
 		eprintln('       Set PROXY_AUTH_USER and PROXY_AUTH_PASS,')
@@ -30,6 +33,9 @@ fn main() {
 		eprintln('       or PROXY_REQUIRE_AUTH=0 to disable authentication.')
 		C.exit(1)
 	}
+
+	lifecycle.install_signal_handlers()
+	idle_dur := lifecycle.idle_timeout_from_env('PROXY_IDLE_TIMEOUT')
 
 	mut server := net.listen_tcp(.ip, listen_addr) or {
 		eprintln('Failed to listen on ${listen_addr}: ${err}')
@@ -39,17 +45,39 @@ fn main() {
 		server.close() or { eprintln('Error closing server: ${err}') }
 	}
 
-	eprintln('Listen on ${listen_addr} ...')
+	eprintln('Listen on ${listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
+	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
+	server.set_accept_timeout(1 * time.second)
 	for {
+		if lifecycle.should_stop() {
+			eprintln('shutdown: stop signal received, closing listener')
+			break
+		}
 		mut socket := server.accept() or {
+			// accept timeout 是正常路径（每 1s 返回一次）；其他错误才报
+			if lifecycle.should_stop() {
+				break
+			}
+			if err.msg() == 'accept timeout' {
+				continue
+			}
 			eprintln('Failed to accept client: ${err}')
 			continue
 		}
 		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
-		go handle_client(mut socket, stats, expected_auth, require_auth)
+		stats.inflight.add(1)
+		go handle_client(mut socket, stats, expected_auth, require_auth, idle_dur)
 	}
+
+	// 等所有 in-flight handle_client 退出后 main 返回，进程退出码 0
+	active := stdatomic.load_i64(&stats.active_conns)
+	if active > 0 {
+		eprintln('shutdown: draining ${active} in-flight connection(s)...')
+	}
+	stats.inflight.wait()
+	eprintln('shutdown: complete')
 }
 
 // 块作用：解析鉴权配置
@@ -86,13 +114,17 @@ fn proxy_auth_config() !(string, bool) {
 // 块作用：客户端连接处理
 // 处理问题：
 // 1. 读取并解析 HTTP 头部
-// 2. 校验 Proxy Basic Auth（认证）
+// 2. 校验 Proxy Basic Auth（认证，issue #1：require_auth=false 时跳过）
 // 3. 处理 CONNECT 隧道（HTTPS/TCP 代理）
 // 4. 处理普通 HTTP 转发及相关头部修改
-fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool) {
+// 5. issue #5：应用 idle timeout；defer 通知 inflight WaitGroup 让优雅退出能 drain
+fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool,
+	idle_dur time.Duration) {
+	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
 		stdatomic.add_i64(&stats.active_conns, -1)
+		stats.inflight.done()
 		socket.close() or {}
 	}
 	defer {
@@ -317,7 +349,7 @@ fn send_simple_response(mut socket net.TcpConn, status_line string, message stri
 }
 
 // 块作用：返回 407 Proxy Authentication Required
-// 处理问题：抽取重复的 407 响应构造逻辑，便于统一维护（之前在 handle_client 内联两次）
+// 处理问题：抽取重复的 407 响应构造逻辑，便于统一维护
 fn send_proxy_auth_required(mut socket net.TcpConn) {
 	gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
 	response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
