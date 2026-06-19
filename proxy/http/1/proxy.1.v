@@ -23,7 +23,13 @@ mut:
 // 处理问题：初始化配置（环境变量）、建立监听、统计活跃连接、分发请求到协程
 fn main() {
 	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { default_listen_addr }
-	expected_auth := proxy_auth_value()
+	expected_auth, require_auth := proxy_auth_config() or {
+		eprintln('Error: ${err}')
+		eprintln('       Set PROXY_AUTH_USER and PROXY_AUTH_PASS,')
+		eprintln('       or PROXY_AUTH_BASIC=<base64(user:pass)>,')
+		eprintln('       or PROXY_REQUIRE_AUTH=0 to disable authentication.')
+		C.exit(1)
+	}
 
 	mut server := net.listen_tcp(.ip, listen_addr) or {
 		eprintln('Failed to listen on ${listen_addr}: ${err}')
@@ -42,22 +48,39 @@ fn main() {
 			continue
 		}
 		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
-		go handle_client(mut socket, stats, expected_auth)
+		go handle_client(mut socket, stats, expected_auth, require_auth)
 	}
 }
 
-// 块作用：认证值计算
-// 处理问题：支持 PROXY_AUTH_BASIC 或 (PROXY_AUTH_USER + PROXY_AUTH_PASS) 环境变量
-fn proxy_auth_value() string {
+// 块作用：解析鉴权配置
+// 处理问题（issue #1）：
+// 1. PROXY_REQUIRE_AUTH=0 关闭鉴权（对齐 SOCKS5 的 SOCKS5_NO_AUTH）
+// 2. PROXY_AUTH_BASIC 优先于 PROXY_AUTH_USER/PASS
+// 3. 缺凭据时 fail-fast：返回错误让 main 退出，避免回落到默认 user:pwd
+// 返回：(Base64 编码的期望凭据, 是否要求鉴权)。require_auth=false 时第一个值无意义。
+fn proxy_auth_config() !(string, bool) {
+	require_auth_str := os.getenv_opt('PROXY_REQUIRE_AUTH') or { '1' }
+	require_auth := require_auth_str != '0'
+
+	if !require_auth {
+		eprintln('WARN: authentication disabled (PROXY_REQUIRE_AUTH=0)')
+		return '', false
+	}
+
 	if basic := os.getenv_opt('PROXY_AUTH_BASIC') {
 		if basic != '' {
-			return basic
+			return basic, true
 		}
 	}
 
-	user := os.getenv_opt('PROXY_AUTH_USER') or { 'user' }
-	pass := os.getenv_opt('PROXY_AUTH_PASS') or { 'pwd' }
-	return base64.encode_str('${user}:${pass}')
+	user := os.getenv_opt('PROXY_AUTH_USER') or { '' }
+	pass := os.getenv_opt('PROXY_AUTH_PASS') or { '' }
+
+	if user == '' || pass == '' {
+		return error('PROXY_AUTH_USER and PROXY_AUTH_PASS must be set')
+	}
+
+	return base64.encode_str('${user}:${pass}'), true
 }
 
 // 块作用：客户端连接处理
@@ -66,7 +89,7 @@ fn proxy_auth_value() string {
 // 2. 校验 Proxy Basic Auth（认证）
 // 3. 处理 CONNECT 隧道（HTTPS/TCP 代理）
 // 4. 处理普通 HTTP 转发及相关头部修改
-fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
+fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool) {
 	start := time.now()
 	defer {
 		stdatomic.add_i64(&stats.active_conns, -1)
@@ -120,19 +143,16 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string) {
 		}
 	}
 
-	if !proxy_authorization.starts_with('Basic ') {
-		gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
-		response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
-		socket.write_string(response) or {}
-		return
-	}
-	provided_cred := proxy_authorization[6..].trim_space().replace('\n', '').replace('\r',
-		'')
-	if provided_cred != expected_auth {
-		gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
-		response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
-		socket.write_string(response) or {}
-		return
+	if require_auth {
+		if !proxy_authorization.starts_with('Basic ') {
+			send_proxy_auth_required(mut socket)
+			return
+		}
+		provided_cred := proxy_authorization[6..].trim_space().replace('\n', '').replace('\r', '')
+		if provided_cred != expected_auth {
+			send_proxy_auth_required(mut socket)
+			return
+		}
 	}
 
 	mut upstream_host := ''
@@ -296,6 +316,14 @@ fn send_simple_response(mut socket net.TcpConn, status_line string, message stri
 	socket.write_string(response) or {}
 }
 
+// 块作用：返回 407 Proxy Authentication Required
+// 处理问题：抽取重复的 407 响应构造逻辑，便于统一维护（之前在 handle_client 内联两次）
+fn send_proxy_auth_required(mut socket net.TcpConn) {
+	gmt := time.now().custom_format('ddd, DD MMM YYYY HH:mm:ss') + ' GMT'
+	response := 'HTTP/1.1 407 Proxy Authentication Required\r\nDate: ${gmt}\r\nProxy-Authenticate: Basic realm="V Proxy"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+	socket.write_string(response) or {}
+}
+
 // 块作用：读取头部原始字节
 // 处理问题：持续读取直至发现 \r\n\r\n 标志，限制头部最大长度 64KB
 fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
@@ -310,7 +338,8 @@ fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 		if data.len > 65536 {
 			return error('Request too large')
 		}
-		header_end := find_header_end_from(data, if data.len > n + 3 { data.len - n - 3 } else { 0 })
+		header_end := find_header_end_from(data,
+			if data.len > n + 3 { data.len - n - 3 } else { 0 })
 		if header_end >= 0 {
 			// 返回 (头部字节数组, 剩余已读取的 body 部分)
 			return data[..header_end], data[header_end + 4..]

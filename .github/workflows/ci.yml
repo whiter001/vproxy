@@ -95,14 +95,15 @@ jobs:
       - name: Run integration tests
         shell: bash
         run: |
-          PROXY_USER=user
-          PROXY_PASS=pwd
+          # issue #1：HTTP 代理要求显式凭据；未设置会 fail-fast
+          export PROXY_AUTH_USER=user
+          export PROXY_AUTH_PASS=pwd
 
           # Test HTTP proxy
           v run proxy/http/1/proxy.1.v &
           HTTP_PID=$!
           sleep 3
-          curl --fail --silent --show-error --proxy-user "${PROXY_USER}:${PROXY_PASS}" -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
+          curl --fail --silent --show-error --proxy-user "${PROXY_AUTH_USER}:${PROXY_AUTH_PASS}" -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
           kill $HTTP_PID 2>/dev/null || true
 
           # Test SOCKS5 proxy
