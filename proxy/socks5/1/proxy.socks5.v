@@ -7,8 +7,7 @@ import os
 import sync
 import sync.stdatomic
 import time
-
-const default_listen_addr = ':5778'
+import vpcli
 
 const socks5_version = u8(5)
 const socks5_auth_no_auth = u8(0)
@@ -44,7 +43,17 @@ fn dial_addr(target_host string, target_port u16, atyp u8) string {
 }
 
 fn main() {
-	listen_addr := os.getenv_opt('SOCKS5_LISTEN_ADDR') or { default_listen_addr }
+	cfg := vpcli.parse_socks5_args(os.args) or { C.exit(1) }
+	if cfg.show_help {
+		vpcli.print_socks5_help()
+		return
+	}
+	if cfg.show_version {
+		println('vproxy ${vpcli.version}')
+		return
+	}
+
+	listen_addr := cfg.listen_addr
 
 	lifecycle.install_signal_handlers()
 	idle_dur := lifecycle.idle_timeout_from_env('SOCKS5_IDLE_TIMEOUT')

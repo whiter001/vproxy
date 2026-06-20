@@ -6,6 +6,7 @@
 - 普通 `HTTP` 请求转发
 - `Proxy-Authorization: Basic ...` 鉴权（默认必填，可关闭）
 - 优雅退出（SIGINT/SIGTERM）+ 慢客户端 idle timeout（issue #5）
+- 命令行参数（issue #4）：`-l/-u/-p/-b/-n/-c/-f/--log-level/-h/-v`
 
 ## ⚠️ 安全提示
 
@@ -20,6 +21,32 @@
 
 ```bash
 v run proxy/http/1/proxy.1.v
+```
+
+## 命令行（issue #4）
+
+```
+Usage: vproxy http serve [options]
+
+  -l, --listen addr         监听地址（覆盖 PROXY_LISTEN_ADDR）
+  -u, --user name           用户名（覆盖 PROXY_AUTH_USER）
+  -p, --pass pwd            密码（覆盖 PROXY_AUTH_PASS）
+  -b, --auth-basic b64      预编码的 Basic 凭据（覆盖 PROXY_AUTH_BASIC）
+  -n, --no-auth             关闭鉴权（等价 PROXY_REQUIRE_AUTH=0）
+  -c, --config path         配置文件（issue #6 预留）
+  -f, --log-format fmt      日志格式 text|json（默认 text）
+      --log-level lvl       日志级别 debug|info|warn|error（默认 info）
+  -h, --help                显示帮助
+  -v, --version             显示版本
+```
+
+优先级：**命令行 > 环境变量 > 默认值**。
+
+```bash
+./proxy.1                          # 默认 :5777
+./proxy.1 -l :8888                 # 监听 :8888
+PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
+./proxy.1 serve --help             # 显式子命令与省略等价
 ```
 
 ## 环境变量
@@ -79,4 +106,5 @@ curl --fail --silent --show-error \
 bash proxy/http/1/test_full.sh         # 本地 upstreams：鉴权 / 头部 / Chunked / CONNECT
 bash proxy/http/1/test_fail_fast.sh    # 未设凭据 fail-fast（issue #1）
 bash proxy/lifecycle/test_lifecycle.sh # 优雅退出 / SO_REUSEADDR / idle timeout（issue #5）
+bash proxy/vpcli/test_cli.sh           # CLI 参数解析（issue #4）
 ```
