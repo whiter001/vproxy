@@ -26,6 +26,31 @@
 v run proxy/socks5/1/proxy.socks5.v
 ```
 
+## 命令行（issue #4）
+
+```
+Usage: vproxy socks5 serve [options]
+
+  -l, --listen addr         监听地址（覆盖 SOCKS5_LISTEN_ADDR）
+  -u, --user name           用户名（覆盖 SOCKS5_AUTH_USERNAME）
+  -p, --pass pwd            密码（覆盖 SOCKS5_AUTH_PASSWORD）
+  -n, --no-auth             关闭鉴权（等价 SOCKS5_NO_AUTH=1）
+  -c, --config path         配置文件（issue #6 预留）
+  -f, --log-format fmt      日志格式 text|json
+      --log-level lvl       日志级别 debug|info|warn|error
+  -h, --help                显示帮助
+  -v, --version             显示版本
+```
+
+优先级：**命令行 > 环境变量 > 默认值**。
+
+```bash
+./proxy.socks5                          # 默认 :5778
+./proxy.socks5 -l :8888                 # 监听 :8888
+SOCKS5_LISTEN_ADDR=:7777 ./proxy.socks5 # env 生效
+./proxy.socks5 serve --version          # 显式子命令与省略等价
+```
+
 ## 环境变量
 
 | 变量                   | 默认值  | 说明              |

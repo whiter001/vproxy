@@ -8,6 +8,7 @@ import os
 import sync
 import sync.stdatomic
 import time
+import vpcli
 
 const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
 const connection_established = 'HTTP/1.1 200 Connection Established\r\n\r\n'
@@ -22,11 +23,25 @@ mut:
 
 // 块作用：入口函数
 // 处理问题：
+// - issue #4：CLI 参数解析（vpcli.parse_http_args）
 // - issue #1：PROXY_REQUIRE_AUTH=0 / fail-fast 配置
 // - issue #5：SIGINT/SIGTERM 优雅退出 + idle timeout
 fn main() {
-	listen_addr := os.getenv_opt('PROXY_LISTEN_ADDR') or { ':5777' }
-	expected_auth, require_auth := proxy_auth_config() or {
+	cfg := vpcli.parse_http_args(os.args) or {
+		eprintln('parse error: ${err}')
+		C.exit(1)
+	}
+	if cfg.show_help {
+		vpcli.print_http_help()
+		return
+	}
+	if cfg.show_version {
+		println('vproxy ${vpcli.version}')
+		return
+	}
+
+	expected_auth, require_auth := proxy_auth_config(cfg.auth_basic, cfg.auth_user, cfg.auth_pass,
+		cfg.require_auth) or {
 		eprintln('Error: ${err}')
 		eprintln('       Set PROXY_AUTH_USER and PROXY_AUTH_PASS,')
 		eprintln('       or PROXY_AUTH_BASIC=<base64(user:pass)>,')
@@ -35,17 +50,17 @@ fn main() {
 	}
 
 	lifecycle.install_signal_handlers()
-	idle_dur := lifecycle.idle_timeout_from_env('PROXY_IDLE_TIMEOUT')
+	idle_dur := cfg.idle_timeout
 
-	mut server := net.listen_tcp(.ip, listen_addr) or {
-		eprintln('Failed to listen on ${listen_addr}: ${err}')
+	mut server := net.listen_tcp(.ip, cfg.listen_addr) or {
+		eprintln('Failed to listen on ${cfg.listen_addr}: ${err}')
 		return
 	}
 	defer {
 		server.close() or { eprintln('Error closing server: ${err}') }
 	}
 
-	eprintln('Listen on ${listen_addr} (idle_timeout=${idle_dur}) ...')
+	eprintln('Listen on ${cfg.listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
 	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
@@ -80,29 +95,22 @@ fn main() {
 	eprintln('shutdown: complete')
 }
 
-// 块作用：解析鉴权配置
-// 处理问题（issue #1）：
-// 1. PROXY_REQUIRE_AUTH=0 关闭鉴权（对齐 SOCKS5 的 SOCKS5_NO_AUTH）
-// 2. PROXY_AUTH_BASIC 优先于 PROXY_AUTH_USER/PASS
-// 3. 缺凭据时 fail-fast：返回错误让 main 退出，避免回落到默认 user:pwd
+// 块作用：鉴权 fail-fast + 凭据编码
+// 处理问题（issue #1 + issue #4）：
+// 1. PROXY_REQUIRE_AUTH=false 关闭鉴权
+// 2. auth_basic 优先于 user/pass
+// 3. 缺凭据时返回 error，由 main 退出（fail-fast）
+// 参数由 vpcli 解析后传入（CLI > env > default）。
 // 返回：(Base64 编码的期望凭据, 是否要求鉴权)。require_auth=false 时第一个值无意义。
-fn proxy_auth_config() !(string, bool) {
-	require_auth_str := os.getenv_opt('PROXY_REQUIRE_AUTH') or { '1' }
-	require_auth := require_auth_str != '0'
-
+fn proxy_auth_config(auth_basic string, user string, pass string, require_auth bool) !(string, bool) {
 	if !require_auth {
 		eprintln('WARN: authentication disabled (PROXY_REQUIRE_AUTH=0)')
 		return '', false
 	}
 
-	if basic := os.getenv_opt('PROXY_AUTH_BASIC') {
-		if basic != '' {
-			return basic, true
-		}
+	if auth_basic != '' {
+		return auth_basic, true
 	}
-
-	user := os.getenv_opt('PROXY_AUTH_USER') or { '' }
-	pass := os.getenv_opt('PROXY_AUTH_PASS') or { '' }
 
 	if user == '' || pass == '' {
 		return error('PROXY_AUTH_USER and PROXY_AUTH_PASS must be set')

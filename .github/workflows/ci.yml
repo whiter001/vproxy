@@ -95,22 +95,31 @@ jobs:
       - name: Run integration tests
         shell: bash
         run: |
-          # issue #1：HTTP 代理要求显式凭据；未设置会 fail-fast
+          # issue #1 / #15：HTTP 代理要求显式凭据；未设置会 fail-fast
+          # 同时这些 env 也被 main 通过 vpcli 解析，必须 export 而不是 bash 局部变量
           export PROXY_AUTH_USER=user
           export PROXY_AUTH_PASS=pwd
+          export SOCKS5_AUTH_USERNAME=user
+          export SOCKS5_AUTH_PASSWORD=pwd
 
           # Test HTTP proxy
           v run proxy/http/1/proxy.1.v &
           HTTP_PID=$!
           sleep 3
-          curl --fail --silent --show-error --proxy-user "${PROXY_AUTH_USER}:${PROXY_AUTH_PASS}" -x 127.0.0.1:5777 https://httpbin.org/get || { kill $HTTP_PID 2>/dev/null; exit 1; }
+          curl --fail --silent --show-error \
+            --proxy-user "${PROXY_AUTH_USER}:${PROXY_AUTH_PASS}" \
+            -x 127.0.0.1:5777 https://httpbin.org/get \
+            || { kill $HTTP_PID 2>/dev/null; exit 1; }
           kill $HTTP_PID 2>/dev/null || true
 
           # Test SOCKS5 proxy
           v run proxy/socks5/1/proxy.socks5.v &
           SOCKS5_PID=$!
           sleep 3
-          curl --fail --silent --show-error --socks5 127.0.0.1:5778 https://httpbin.org/get || { kill $SOCKS5_PID 2>/dev/null; exit 1; }
+          curl --fail --silent --show-error \
+            --proxy-user "${SOCKS5_AUTH_USERNAME}:${SOCKS5_AUTH_PASSWORD}" \
+            --socks5 127.0.0.1:5778 https://httpbin.org/get \
+            || { kill $SOCKS5_PID 2>/dev/null; exit 1; }
           kill $SOCKS5_PID 2>/dev/null || true
 
   release:
