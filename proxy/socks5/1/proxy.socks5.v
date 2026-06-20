@@ -1,6 +1,7 @@
 module main
 
 import io
+import lifecycle
 import net
 import os
 import sync
@@ -28,6 +29,7 @@ const socks5_rep_address_not_supported = u8(8)
 struct Stats {
 mut:
 	active_conns i64
+	inflight     sync.WaitGroup
 }
 
 // 块作用：根据 atyp 构造 dial 地址字符串
@@ -44,6 +46,9 @@ fn dial_addr(target_host string, target_port u16, atyp u8) string {
 fn main() {
 	listen_addr := os.getenv_opt('SOCKS5_LISTEN_ADDR') or { default_listen_addr }
 
+	lifecycle.install_signal_handlers()
+	idle_dur := lifecycle.idle_timeout_from_env('SOCKS5_IDLE_TIMEOUT')
+
 	mut server := net.listen_tcp(.ip, listen_addr) or {
 		eprintln('Failed to listen on ${listen_addr}: ${err}')
 		return
@@ -52,24 +57,46 @@ fn main() {
 		server.close() or { eprintln('Error closing server: ${err}') }
 	}
 
-	eprintln('SOCKS5 proxy listening on ${listen_addr} ...')
+	eprintln('SOCKS5 proxy listening on ${listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
+	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
+	server.set_accept_timeout(1 * time.second)
 
 	for {
+		if lifecycle.should_stop() {
+			eprintln('shutdown: stop signal received, closing listener')
+			break
+		}
 		mut socket := server.accept() or {
+			if lifecycle.should_stop() {
+				break
+			}
+			if err.msg() == 'accept timeout' {
+				continue
+			}
 			eprintln('Failed to accept client: ${err}')
 			continue
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
-		go handle_client(mut socket, stats)
+		stats.inflight.add(1)
+		go handle_client(mut socket, stats, idle_dur)
 	}
+
+	active := stdatomic.load_i64(&stats.active_conns)
+	if active > 0 {
+		eprintln('shutdown: draining ${active} in-flight connection(s)...')
+	}
+	stats.inflight.wait()
+	eprintln('shutdown: complete')
 }
 
-fn handle_client(mut socket net.TcpConn, stats &Stats) {
+fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration) {
+	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
 		stdatomic.add_i64(&stats.active_conns, -1)
+		stats.inflight.done()
 		socket.close() or {}
 	}
 	defer {
@@ -81,7 +108,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats) {
 		return
 	}
 
-	handle_request(mut socket)
+	handle_request(mut socket, idle_dur)
 }
 
 fn handle_greeting_and_auth(mut socket net.TcpConn) bool {
@@ -194,7 +221,7 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 	return false
 }
 
-fn handle_request(mut socket net.TcpConn) {
+fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 	mut header := []u8{len: 4}
 	n := socket.read(mut header) or {
 		eprintln('Failed to read request header: ${err}')
@@ -267,7 +294,7 @@ fn handle_request(mut socket net.TcpConn) {
 
 	match cmd {
 		socks5_cmd_connect {
-			handle_connect(mut socket, target_host, target_port, atyp)
+			handle_connect(mut socket, target_host, target_port, atyp, idle_dur)
 		}
 		else {
 			// BIND / UDP ASSOCIATE 当前未实现（README 已说明）。
@@ -276,7 +303,12 @@ fn handle_request(mut socket net.TcpConn) {
 	}
 }
 
-fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, atyp u8) {
+// 处理问题：
+// - issue #3：用 dial_addr 拼装 host:port（IPv6 加方括号）
+// - issue #3：send_reply 用 atyp 输出对应长度（10/22/7+N）
+// - issue #5：upstream 应用 idle timeout
+fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, atyp u8,
+	idle_dur time.Duration) {
 	addr_str := dial_addr(target_host, target_port, atyp)
 	mut upstream := net.dial_tcp(addr_str) or {
 		eprintln('Failed to connect to ${addr_str}: ${err}')
@@ -286,6 +318,8 @@ fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, a
 	defer {
 		upstream.close() or {}
 	}
+	// 给 upstream 同样设置 idle timeout，避免慢上游长时间占用 fd
+	lifecycle.apply_idle_timeout(mut upstream, idle_dur)
 
 	// 回写成功 reply，回包 ATYP 与请求一致（RFC 1928 §6）。
 	send_reply(mut socket, socks5_rep_success, atyp, 0)

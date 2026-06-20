@@ -18,6 +18,8 @@ proxy/http/1/proxy.1
 proxy/http/1/proxy.1.exe
 proxy/http/1/proxy_test_bin
 proxy/http/1/proxy_fail_fast_bin
+proxy/lifecycle/http_lifecycle_bin
+proxy/lifecycle/socks5_lifecycle_bin
 proxy/socks5/1/proxy.socks5
 proxy/socks5/1/socks5_test
 proxy/socks5/1/proxy_fail_fast_bin

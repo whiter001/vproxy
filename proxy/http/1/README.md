@@ -5,6 +5,7 @@
 - `CONNECT` 隧道
 - 普通 `HTTP` 请求转发
 - `Proxy-Authorization: Basic ...` 鉴权（默认必填，可关闭）
+- 优雅退出（SIGINT/SIGTERM）+ 慢客户端 idle timeout（issue #5）
 
 ## ⚠️ 安全提示
 
@@ -30,6 +31,21 @@ v run proxy/http/1/proxy.1.v
 | `PROXY_AUTH_USER` | _无_ | 代理用户名；**未设置时进程 fail-fast** |
 | `PROXY_AUTH_PASS` | _无_ | 代理密码；**未设置时进程 fail-fast** |
 | `PROXY_AUTH_BASIC` | _无_ | 直接提供 Base64 编码后的 `username:password`，优先级最高 |
+| `PROXY_IDLE_TIMEOUT` | `300` | 单连接最大空闲秒数（issue #5，`0` 禁用） |
+
+## 生命周期（issue #5）
+
+| 行为 | 实现 |
+| --- | --- |
+| SIGINT / SIGTERM 优雅退出 | `lifecycle.install_signal_handlers()` + `set_accept_timeout(1s)` 周期性检查停止标志；收到信号后停止 accept，等在飞连接完成 |
+| 在飞连接 drain | 主循环退出后 `sync.WaitGroup.wait()` 等待所有 `handle_client` 返回 |
+| 慢客户端 idle timeout | `lifecycle.apply_idle_timeout()` 设置 `set_read_timeout` / `set_write_timeout` |
+| SO_REUSEADDR | V 标准库默认开启（`vlib/net/tcp.c.v:662`） |
+| TCP_NODELAY | V 标准库默认开启（`vlib/net/tcp.c.v:673`） |
+
+退出码约定：
+- `0`：正常退出（SIGTERM 后 drain 完成）
+- `1`：配置错误（缺凭据等，参见 issue #1）
 
 ## 示例
 
@@ -44,25 +60,23 @@ PROXY_REQUIRE_AUTH=0 \
   PROXY_LISTEN_ADDR=127.0.0.1:5777 \
   v run proxy/http/1/proxy.1.v
 curl -x http://127.0.0.1:5777 http://httpbin.org/ip
+
+# 自定义 idle timeout = 60s
+PROXY_IDLE_TIMEOUT=60 v run proxy/http/1/proxy.1.v
 ```
 
 ## Curl 测试
 
-可以用下面的命令验证代理是否能正常访问 `httpbin.org/get`，并分别覆盖 `HTTPS CONNECT` 和普通 `HTTP` 转发：
-
 ```bash
 curl --fail --silent --show-error \
-  -x http://user:pwd@127.0.0.1:5777 \
+  -x http://alice:secret@127.0.0.1:5777 \
   https://httpbin.org/get
-
-curl --fail --silent --show-error \
-  -x http://user:pwd@127.0.0.1:5777 \
-  http://httpbin.org/get
 ```
 
-本地完整集成测试：
+## 集成测试
 
 ```bash
-bash proxy/http/1/test_full.sh    # 启动本地 upstream，覆盖鉴权 / 头部 / Chunked / CONNECT
-bash proxy/http/1/test_fail_fast.sh  # 验证未设凭据时 fail-fast
+bash proxy/http/1/test_full.sh         # 本地 upstreams：鉴权 / 头部 / Chunked / CONNECT
+bash proxy/http/1/test_fail_fast.sh    # 未设凭据 fail-fast（issue #1）
+bash proxy/lifecycle/test_lifecycle.sh # 优雅退出 / SO_REUSEADDR / idle timeout（issue #5）
 ```
