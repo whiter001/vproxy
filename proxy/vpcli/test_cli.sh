@@ -57,7 +57,9 @@ fi
 
 # ---------------------------------------------------------------------------
 echo "--- 测试 3: HTTP -l 覆盖 PROXY_LISTEN_ADDR ---"
-PROXY_LISTEN_ADDR=127.0.0.1:8888 "$http_bin" -l 127.0.0.1:9991 > /tmp/cli_h.log 2>&1 &
+PROXY_LISTEN_ADDR=127.0.0.1:8888 \
+PROXY_AUTH_USER=u PROXY_AUTH_PASS=p \
+"$http_bin" -l 127.0.0.1:9991 > /tmp/cli_h.log 2>&1 &
 pid=$!
 sleep 0.8
 if grep -q 'Listen on 127.0.0.1:9991' /tmp/cli_h.log; then
@@ -71,7 +73,9 @@ cleanup_pid "$pid"
 
 # ---------------------------------------------------------------------------
 echo "--- 测试 4: HTTP 仅设 PROXY_LISTEN_ADDR ---"
-PROXY_LISTEN_ADDR=127.0.0.1:9992 "$http_bin" > /tmp/cli_h.log 2>&1 &
+PROXY_LISTEN_ADDR=127.0.0.1:9992 \
+PROXY_AUTH_USER=u PROXY_AUTH_PASS=p \
+"$http_bin" > /tmp/cli_h.log 2>&1 &
 pid=$!
 sleep 0.8
 if grep -q 'Listen on 127.0.0.1:9992' /tmp/cli_h.log; then
@@ -98,7 +102,7 @@ fi
 
 # ---------------------------------------------------------------------------
 echo "--- 测试 6: HTTP 显式子命令 serve ---"
-"$http_bin" serve -l 127.0.0.1:9993 > /tmp/cli_h.log 2>&1 &
+PROXY_AUTH_USER=u PROXY_AUTH_PASS=p "$http_bin" serve -l 127.0.0.1:9993 > /tmp/cli_h.log 2>&1 &
 pid=$!
 sleep 0.8
 if grep -q 'Listen on 127.0.0.1:9993' /tmp/cli_h.log; then
