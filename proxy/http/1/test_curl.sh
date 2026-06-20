@@ -7,6 +7,10 @@ repo_root="$(cd "$script_dir/../../../" && pwd)"
 listen_addr="127.0.0.1:5777"
 log_file="${script_dir}/proxy.1.log"
 
+# issue #1：vproxy 在缺凭据时 fail-fast，脚本必须显式设置
+export PROXY_AUTH_USER="${PROXY_AUTH_USER:-user}"
+export PROXY_AUTH_PASS="${PROXY_AUTH_PASS:-pwd}"
+
 cleanup() {
 	if [[ -n "${proxy_pid:-}" ]]; then
 		kill "${proxy_pid}" >/dev/null 2>&1 || true

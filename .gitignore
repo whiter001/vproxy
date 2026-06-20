@@ -16,6 +16,12 @@ $RECYCLE.BIN/
 # Build artifacts
 proxy/http/1/proxy.1
 proxy/http/1/proxy.1.exe
+proxy/http/1/proxy_test_bin
+proxy/http/1/proxy_fail_fast_bin
+proxy/socks5/1/proxy.socks5
+proxy/socks5/1/socks5_test
+proxy/socks5/1/proxy_fail_fast_bin
+proxy/socks5/1/upstream_failfast.log
 *.exe
 *.dll
 *.so
