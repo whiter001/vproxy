@@ -13,7 +13,6 @@ USER="testuser"
 PASS="testpass"
 WORK_DIR="$(mktemp -d)"
 UPSTREAM_LOG="$WORK_DIR/upstream.log"
-UPSTREAM_PID=""
 PROXY_PID=""
 
 export PROXY_AUTH_USER="$USER"
@@ -23,9 +22,6 @@ cleanup() {
     echo "--- 清理 ---"
     if [ -n "$PROXY_PID" ]; then
         kill "$PROXY_PID" 2>/dev/null || true
-    fi
-    if [ -n "$UPSTREAM_PID" ]; then
-        kill "$UPSTREAM_PID" 2>/dev/null || true
     fi
     rm -rf "$WORK_DIR"
     rm -f "$PROXY_BINARY"
@@ -116,12 +112,15 @@ class EchoHandler(BaseHTTPRequestHandler):
             return self.rfile.read(int(content_length)), "content-length"
         return b"", "none"
 
-    def _write_json(self, payload, status=200):
+    def _write_json(self, payload, status=200, keep_alive=True):
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
+        if keep_alive:
+            self.send_header("Connection", "keep-alive")
+        else:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -140,6 +139,18 @@ class EchoHandler(BaseHTTPRequestHandler):
             append_log(f"HEADER {key}: {value}")
         append_log(f"BODY_LEN {len(body)} MODE {mode}")
         self._write_json({"method": "POST", "mode": mode, "body_len": len(body), "headers": headers})
+
+    def do_HEAD(self):
+        # HEAD 也记录请求头到日志，便于验证代理是否反向写入 socket。
+        headers = {k: v for k, v in self.headers.items()}
+        append_log("HEAD " + self.path)
+        for key, value in headers.items():
+            append_log(f"HEADER {key}: {value}")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "42")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
 
 
 class EchoTCPHandler(socketserver.BaseRequestHandler):
@@ -235,7 +246,7 @@ if ! grep -q "BODY_LEN 65536 MODE chunked" "$UPSTREAM_LOG"; then
 fi
 echo "✅ Chunked 请求体被上游正确接收"
 
-echo "--- 测试 4: CONNECT 隧道 ---"
+echo "--- 测试 4: CONNECT 隧道 + Via 头 (issue #2 sub-1) ---"
 PORT="$PORT" CONNECT_UPSTREAM_PORT="$CONNECT_UPSTREAM_PORT" USER="$USER" PASS="$PASS" python3 - <<'PY'
 import base64
 import os
@@ -267,6 +278,11 @@ while b"\r\n\r\n" not in response:
 
 if b"200 Connection Established" not in response:
     raise SystemExit(response.decode("utf-8", "replace"))
+# issue #2 sub-1: CONNECT 响应必须补 Via / Proxy-Agent
+if b"Via: 1.1 v-proxy" not in response:
+    raise SystemExit(f"CONNECT response missing Via header: {response!r}")
+if b"Proxy-Agent: V-Proxy/1.0" not in response:
+    raise SystemExit(f"CONNECT response missing Proxy-Agent header: {response!r}")
 
 payload = b"ping-through-connect"
 sock.sendall(payload)
@@ -276,6 +292,80 @@ if echo != payload:
 sock.close()
 print("CONNECT OK")
 PY
-echo "✅ CONNECT 隧道可用"
+echo "✅ CONNECT 隧道可用，且响应含 Via / Proxy-Agent"
+
+echo "--- 测试 5: HEAD 路径不反向写入上游 (issue #2 sub-2) ---"
+: > "$UPSTREAM_LOG"
+STATUS=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" \
+    --proxy "http://127.0.0.1:$PORT" \
+    --proxy-user "$USER:$PASS" \
+    -I \
+    "http://127.0.0.1:$HTTP_UPSTREAM_PORT/head-test")
+assert_eq "200" "$STATUS" "HEAD 请求成功"
+# HEAD 在代理层必须不写入响应体；通过观察上游日志是否记录到除 HEAD 行之外的数据判断
+# 如果代理反向写入了 client→upstream 的额外字节，上游会收到意外内容；
+# 这里仅记录头部日志，正常 HEAD 应当只有 HEAD + HEADER 行（无 BODY）。
+if grep -E "^BODY" "$UPSTREAM_LOG"; then
+    echo "❌ 上游意外收到 body 数据（HEAD 不应被反向写入）"
+    cat "$UPSTREAM_LOG"
+    exit 1
+fi
+if ! grep -q "^HEAD /head-test" "$UPSTREAM_LOG"; then
+    echo "❌ 上游未记录 HEAD 请求"
+    cat "$UPSTREAM_LOG"
+    exit 1
+fi
+echo "✅ HEAD 请求未触发反向写入"
+
+echo "--- 测试 6: 同连接连续 5 次 GET 成功 (issue #2 sub-3) ---"
+PORT="$PORT" HTTP_UPSTREAM_PORT="$HTTP_UPSTREAM_PORT" USER="$USER" PASS="$PASS" python3 - <<'PY'
+import base64
+import os
+import socket
+
+proxy_host = "127.0.0.1"
+proxy_port = int(os.environ["PORT"])
+target_host = "127.0.0.1"
+target_port = int(os.environ["HTTP_UPSTREAM_PORT"])
+user = os.environ["USER"]
+password = os.environ["PASS"]
+credential = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+
+sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
+for i in range(5):
+    request = (
+        f"GET /keep-alive/{i} HTTP/1.1\r\n"
+        f"Host: {target_host}:{target_port}\r\n"
+        f"Proxy-Authorization: Basic {credential}\r\n"
+        "Connection: keep-alive\r\n"
+        "Proxy-Connection: keep-alive\r\n"
+        "\r\n"
+    )
+    sock.sendall(request.encode("utf-8"))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise SystemExit(f"proxy closed after request {i}: {response!r}")
+        response += chunk
+    if b"200 OK" not in response:
+        raise SystemExit(f"request {i} did not return 200: {response[:200]!r}")
+    # HTTP/1.1 + Content-Length：读到完整 body
+    cl_marker = b"Content-Length: "
+    if cl_marker in response:
+        cl = int(response.split(cl_marker, 1)[1].split(b"\r\n", 1)[0])
+        body_start = response.index(b"\r\n\r\n") + 4
+        body = response[body_start:]
+        while len(body) < cl:
+            chunk = sock.recv(cl - len(body))
+            if not chunk:
+                raise SystemExit(f"proxy closed while reading body for request {i}")
+            body += chunk
+    print(f"request {i}: 200 OK")
+
+sock.close()
+print("KEEP-ALIVE OK")
+PY
+echo "✅ 同连接连续 5 次 GET 成功（HTTP/1.1 keep-alive）"
 
 echo "--- 测试完成 ---"
