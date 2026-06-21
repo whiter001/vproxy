@@ -155,6 +155,87 @@ kill -TERM "$http_pid"
 wait "$http_pid" 2>/dev/null
 
 # ---------------------------------------------------------------------------
+echo "--- 测试 5: HTTP PROXY_IDLE_TIMEOUT=0 —— idle 连接永远不会被关闭 ---"
+# 与测试 3 形成对照：测试 3 是 idle=2s 触发 400 + 关闭；这里是 0 = 禁用，
+# 应该走 lifecycle.apply_idle_timeout 的早 return 分支（time.infinite）。
+# 用 Python 客户端做完整测试：连上 → sleep 4s → 发请求 → 期望代理仍响应。
+echo_upstream_port=18910
+python3 - <<PY > /dev/null 2>&1 &
+import socket, threading, time
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', $echo_upstream_port))
+srv.listen(8)
+def serve():
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError: return
+        threading.Thread(target=lambda c=conn: echo(c), daemon=True).start()
+def echo(c):
+    try:
+        while True:
+            data = c.recv(4096)
+            if not data: break
+            c.sendall(data)
+    except OSError: pass
+    finally: c.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(60)
+PY
+echo_upstream_pid=$!
+sleep 0.5
+
+PROXY_LISTEN_ADDR="$listen_addr" \
+PROXY_AUTH_USER="$auth_user" PROXY_AUTH_PASS="$auth_pass" \
+PROXY_IDLE_TIMEOUT=0 \
+"$http_bin" > "$http_log" 2>&1 &
+http_pid=$!
+wait_port 5780
+
+python3 - <<PY
+import socket, time, base64, sys
+s = socket.create_connection(('127.0.0.1', 5780), timeout=10)
+# 不发任何数据，sleep 4s（> 测试 3 的 idle=2s 触发窗口）
+time.sleep(4)
+auth = base64.b64encode(b'lcuser:lcpass').decode().strip()
+req = (
+    f"GET /probe HTTP/1.1\r\n"
+    f"Host: 127.0.0.1:$echo_upstream_port\r\n"
+    f"Proxy-Authorization: Basic {auth}\r\n"
+    f"Connection: close\r\n"
+    f"\r\n"
+).encode()
+s.sendall(req)
+buf = b''
+try:
+    while len(buf) < 1024:
+        chunk = s.recv(1024 - len(buf))
+        if not chunk: break
+        buf += chunk
+except socket.timeout:
+    print(f'TIMEOUT after {len(buf)} bytes', file=sys.stderr)
+s.close()
+print(f'GOT {len(buf)} bytes: {buf[:120]!r}', flush=True)
+# 关键断言：idle=0 时连接 4s 后仍能正常转发，客户端收到了代理响应字节。
+# echo upstream 是 TCP echo，所以客户端收到的就是请求原文（代理 io.cp 透传）；
+# 只要收到内容，就证明 idle=0 没把连接错误关闭。
+assert len(buf) > 0, '代理关闭了 idle=0 的连接（不应发生）'
+print('IDLE0_OK')
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ PROXY_IDLE_TIMEOUT=0 时连接 4s 后仍活跃（echo 通了）"
+else
+    echo "❌ PROXY_IDLE_TIMEOUT=0 测试失败：idle=0 应禁用超时"
+    cat "$http_log"
+    failed=$((failed + 1))
+fi
+
+kill -TERM "$http_pid"
+wait "$http_pid" 2>/dev/null
+cleanup_pid "$echo_upstream_pid"
+
+# ---------------------------------------------------------------------------
 echo "--- 测试 4: SOCKS5 SIGTERM 优雅退出 ---"
 SOCKS5_LISTEN_ADDR="127.0.0.1:5781" \
 SOCKS5_IDLE_TIMEOUT=300 \
