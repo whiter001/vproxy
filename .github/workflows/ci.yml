@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        proxy: [http, socks5, socks4]
+        proxy: [http, socks5, socks4, mproxy-serve, mproxy-client, mproxy-server]
         target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
         include:
           - proxy: http
@@ -44,6 +44,12 @@ jobs:
             src: proxy/socks5/1/proxy.socks5.v
           - proxy: socks4
             src: proxy/socks4/1/proxy.socks4.v
+          - proxy: mproxy-serve
+            src: proxy/mproxy/1/mproxy.serve.v
+          - proxy: mproxy-client
+            src: proxy/mproxy/1/mproxy.client.v
+          - proxy: mproxy-server
+            src: proxy/mproxy/1/mproxy.server.v
           - target: windows-x86_64
             os: windows-latest
             bin_ext: .exe
@@ -146,7 +152,7 @@ jobs:
         with:
           check-latest: true
 
-      # WebSocket 协议 + SOCKS4 + lifecycle + CLI 解析（全部本地，无外网依赖）
+      # WebSocket 协议 + SOCKS4 + lifecycle + CLI 解析 + mproxy 全套（全部本地，无外网依赖）
       - name: Run integration tests (no network)
         shell: bash
         run: |
@@ -154,6 +160,9 @@ jobs:
           bash proxy/socks4/1/test_protocol.sh
           bash proxy/lifecycle/test_lifecycle.sh
           bash proxy/vpcli/test_cli.sh
+          bash proxy/mproxy/1/test_serve.sh
+          bash proxy/mproxy/1/test_tunnel.sh
+          bash proxy/mproxy/1/test_socks5_upstream.sh
 
   release:
     runs-on: ubuntu-latest
