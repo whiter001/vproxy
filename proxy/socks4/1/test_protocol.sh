@@ -233,6 +233,49 @@ else
     failed=$((failed + 1))
 fi
 
+# ---------------------------------------------------------------------------
+echo "--- 测试 5b: SOCKS4 BIND (CD=2) → 立即关闭（SOCKS4 spec 不实现 BIND）---"
+python3 - <<'PY'
+import socket, struct
+proxy = socket.create_connection(('127.0.0.1', 5784), timeout=3)
+# CD=2 = BIND，spec 定义但 vproxy 不实现。期望：parse_request 检测 cd != 1 返回 error，
+# handle_client 直接关闭连接，不发 reply（与错 VN 行为一致）。
+req = b'\x04\x02' + struct.pack('>H', 80) + bytes([127,0,0,1]) + b'alice\x00'
+proxy.sendall(req)
+proxy.settimeout(2)
+data = proxy.recv(8)
+assert data == b'', f'expected close, got {data!r}'
+print(f'  BIND (CD=2) connection closed')
+proxy.close()
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ BIND 命令被拒"
+else
+    echo "❌ BIND 未立即关闭"
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 5c: 无效 CD（3, 99）→ 立即关闭 ---"
+python3 - <<'PY'
+import socket, struct
+for cd_byte in (3, 99):
+    proxy = socket.create_connection(('127.0.0.1', 5784), timeout=3)
+    req = bytes([4, cd_byte]) + struct.pack('>H', 80) + bytes([127,0,0,1]) + b'alice\x00'
+    proxy.sendall(req)
+    proxy.settimeout(2)
+    data = proxy.recv(8)
+    assert data == b'', f'CD={cd_byte}: expected close, got {data!r}'
+    proxy.close()
+print(f'  CD=3 and CD=99 both closed immediately')
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ 无效 CD 被拒"
+else
+    echo "❌ 无效 CD 未立即关闭"
+    failed=$((failed + 1))
+fi
+
 # ===========================================================================
 # 切到 --no-auth 模式：重启 proxy，SOCKS4_NO_AUTH=1 跳过 USERID 校验
 echo ""
