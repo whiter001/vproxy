@@ -75,7 +75,10 @@ fn main() {
 			if lifecycle.should_stop() {
 				break
 			}
-			if err.msg() == 'accept timeout' {
+			// V 0.5.x 在 macOS 上的 accept 超时错误消息是 'net: op timed out; code: 9'，
+			// 旧版是 'accept timeout'。两者都接受，避免每秒钟打印一行错误日志。
+			msg := err.msg()
+			if msg == 'accept timeout' || msg.contains('op timed out') {
 				continue
 			}
 			eprintln('Failed to accept client: ${err}')
@@ -170,6 +173,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	header_lines := header_str.split('\r\n')
 	mut proxy_authorization := ''
 	mut host_header := ''
+	mut upgrade_value := ''
+	mut connection_value := ''
 
 	for line in header_lines {
 		if line == '' {
@@ -180,6 +185,27 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			proxy_authorization = line.all_after(':').trim_space()
 		} else if lower.starts_with('host:') {
 			host_header = line.all_after(':').trim_space()
+		} else if lower.starts_with('upgrade:') {
+			upgrade_value = line.all_after(':').trim_space().to_lower()
+		} else if lower.starts_with('connection:') {
+			connection_value = line.all_after(':').trim_space().to_lower()
+		}
+	}
+
+	// WebSocket 检测：RFC 6455 §4.1 要求同时存在 Upgrade: websocket 与 Connection: Upgrade
+	// （后者可能是逗号分隔列表，如 "keep-alive, Upgrade"）。
+	mut is_websocket := upgrade_value == 'websocket'
+	if is_websocket {
+		for token in connection_value.split(',') {
+			if token.trim_space() == 'upgrade' {
+				is_websocket = true
+				break
+			}
+		}
+		if !is_websocket {
+			// Upgrade 是 websocket 但 Connection 没列出 upgrade：仍按 WebSocket 处理
+			// （某些宽松客户端会省略 Connection 头）
+			is_websocket = true
 		}
 	}
 
@@ -205,6 +231,22 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			send_simple_response(mut socket, '400 Bad Request', 'Missing CONNECT target\n')
 			return
 		}
+	} else if is_websocket {
+		upstream_host, request_path = split_target(target)
+		if upstream_host == '' {
+			upstream_host = host_header
+		}
+		if upstream_host == '' {
+			send_simple_response(mut socket, '400 Bad Request', 'Missing ws/wss target\n')
+			return
+		}
+		// ws:// → :80, wss:// → :443（split_target 已剥掉 scheme）
+		mut ws_default := default_http_port
+		if target.starts_with('wss://') {
+			ws_default = default_https_port
+		}
+		upstream_host = normalize_authority(upstream_host, ws_default)
+		forwarded_first_line = '${method} ${request_path} ${version}'
 	} else {
 		upstream_host, request_path = split_target(target)
 		if upstream_host == '' {
@@ -232,6 +274,116 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			eprintln('Failed to send CONNECT response: ${err}')
 			return
 		}
+	} else if is_websocket {
+		// 块作用：WebSocket 握手 + 透传
+		// 处理问题（RFC 6455）：
+		// 1. 重写请求行：absolute URI → origin form（上游是 origin server，不接受 ws:// 前缀）
+		// 2. 保留 Upgrade/Connection/Sec-WebSocket-*/Origin；剥离 Proxy-* 防凭据泄露
+		// 3. **不**注入 Via/Proxy-Agent：部分 WebSocket 服务端对未知头挑剔
+		// 4. 读上游响应直到 \r\n\r\n：状态码 == 101 则进入双向中继，否则透传给客户端并关闭
+		mut ws_headers := []string{}
+		ws_headers << forwarded_first_line
+		mut has_host_header := false
+		for i, line in header_lines {
+			if i == 0 {
+				continue // 已用 forwarded_first_line 代替
+			}
+			if line == '' {
+				continue
+			}
+			lower := line.to_lower()
+			if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:')
+				|| lower.starts_with('proxy-connection:') {
+				continue
+			}
+			if lower.starts_with('host:') {
+				has_host_header = true
+			}
+			ws_headers << line
+		}
+		if !has_host_header && upstream_host != '' {
+			ws_headers << 'Host: ${upstream_host}'
+		}
+		ws_headers << ''
+		request_blob := ws_headers.join('\r\n') + '\r\n'
+		upstream.write_string(request_blob) or {
+			eprintln('Failed to forward WebSocket upgrade: ${err}')
+			return
+		}
+		if pending_body.len > 0 {
+			upstream.write(pending_body) or {
+				eprintln('Failed to forward pending body: ${err}')
+				return
+			}
+		}
+
+		// 读上游 handshake response 直到 \r\n\r\n，复用 find_header_end_from
+		mut resp_buf := []u8{}
+		mut read_buf := []u8{len: 8192}
+		mut header_end := -1
+		for header_end < 0 {
+			nn := upstream.read(mut read_buf) or {
+				eprintln('Failed to read upstream WebSocket response: ${err}')
+				return
+			}
+			if nn <= 0 {
+				eprintln('WebSocket upstream closed before handshake response')
+				return
+			}
+			resp_buf << read_buf[..nn]
+			if resp_buf.len > 65536 {
+				eprintln('WebSocket upstream response too large')
+				return
+			}
+			header_end = find_header_end_from(resp_buf, if resp_buf.len > nn + 3 {
+				resp_buf.len - nn - 3
+			} else {
+				0
+			})
+		}
+
+		// 透传整个 response 给客户端（headers + 任何已读的额外字节）
+		socket.write(resp_buf) or {
+			eprintln('Failed to forward WebSocket response: ${err}')
+			return
+		}
+
+		// 校验状态码：必须是 101 Switching Protocols
+		resp_head_str := resp_buf[..header_end].bytestr()
+		status_line := resp_head_str.all_before('\r\n')
+		mut is_101 := false
+		// HTTP/1.1 形式：「HTTP/1.1 101 Switching Protocols」
+		status_parts := status_line.split(' ')
+		if status_parts.len >= 2 && status_parts[0].starts_with('HTTP/') {
+			is_101 = status_parts[1] == '101'
+		}
+		if !is_101 {
+			eprintln('WebSocket upstream returned non-101: ${status_line}')
+			return
+		}
+		eprintln('WebSocket: 101 handshake OK, entering relay')
+
+		// 双向 io.cp 中继（与 CONNECT 相同的 close-on-error 模式）
+		mut wg := sync.new_waitgroup()
+		wg.add(2)
+		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+			defer {
+				src.close() or {}
+				dst.close() or {}
+				wg.done()
+			}
+			io.cp(mut src, mut dst) or {}
+		}(mut socket, mut upstream, mut wg)
+		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+			defer {
+				src.close() or {}
+				dst.close() or {}
+				wg.done()
+			}
+			io.cp(mut src, mut dst) or {}
+		}(mut upstream, mut socket, mut wg)
+		wg.wait()
+		return
 	} else {
 		// Parse headers from header_str
 		header_str_lines := header_str.split('\r\n')
@@ -312,13 +464,23 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 }
 
 // 块作用：目标解析
-// 处理问题：从请求路径中提取 Host 和 Path，处理绝对 URL 和相对路径
+// 处理问题：从请求路径中提取 Host 和 Path，处理绝对 URL 和相对路径。
+// 识别 http://、https://、ws://、wss:// 四种 scheme（WebSocket 代理用）。
 fn split_target(target string) (string, string) {
 	mut authority := ''
 	mut path := '/'
 
-	if target.starts_with('http://') || target.starts_with('https://') {
-		without_scheme := target.all_after('://')
+	if target.starts_with('http://') || target.starts_with('https://')
+		|| target.starts_with('ws://') || target.starts_with('wss://') {
+		without_scheme := if target.starts_with('wss://') {
+			target.all_after('wss://')
+		} else if target.starts_with('ws://') {
+			target.all_after('ws://')
+		} else if target.starts_with('https://') {
+			target.all_after('https://')
+		} else {
+			target.all_after('http://')
+		}
 		slash_index := without_scheme.index('/') or { -1 }
 		if slash_index >= 0 {
 			authority = without_scheme[..slash_index]
