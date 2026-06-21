@@ -20,7 +20,6 @@
 module main
 
 import flag
-import io
 import lifecycle
 import net
 import os
@@ -240,7 +239,7 @@ fn handle_client(mut socket net.TcpConn, remote string, stats &Stats, idle_dur t
 
 // 块作用：io.cp 的 XOR 包装版本——拷贝每批字节后 XOR ^ 1 再写出去
 // 处理问题：io.cp 内部走 Reader/Writer 接口，不能中途插入字节变换。
-// 手动循环 read → xor → write。
+// 手动循环 read → xor.apply → write。
 fn xor_pipe(mut src net.TcpConn, mut dst net.TcpConn) ! {
 	for {
 		mut buf := []u8{len: 4096}
@@ -248,10 +247,9 @@ fn xor_pipe(mut src net.TcpConn, mut dst net.TcpConn) ! {
 		if n <= 0 {
 			return
 		}
-		// XOR buffer 中的有效字节
-		for i in 0 .. n {
-			buf[i] = buf[i] ^ 1
-		}
-		dst.write(buf[..n]) or { return err }
+		// 截取有效字节切片并 XOR ^ 1（复用 xor.apply 保证实现一致）
+		mut payload := buf[..n]
+		xor.apply(mut payload)
+		dst.write(payload) or { return err }
 	}
 }

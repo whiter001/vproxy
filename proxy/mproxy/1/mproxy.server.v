@@ -23,7 +23,6 @@
 module main
 
 import flag
-import io
 import lifecycle
 import net
 import os
