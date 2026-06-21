@@ -4,6 +4,7 @@
 
 - `CONNECT` 隧道
 - 普通 `HTTP` 请求转发
+- **WebSocket 代理**（HTTP/1.1 `Upgrade: websocket` 握手 + 帧透传，RFC 6455）
 - `Proxy-Authorization: Basic ...` 鉴权（默认必填，可关闭）
 - 优雅退出（SIGINT/SIGTERM）+ 慢客户端 idle timeout（issue #5）
 - 命令行参数（issue #4）：`-l/-u/-p/-b/-n/-c/-f/--log-level/-h/-v`
@@ -105,6 +106,7 @@ curl --fail --silent --show-error \
 ```bash
 bash proxy/http/1/test_full.sh         # 本地 upstreams：鉴权 / 头部 / Chunked / CONNECT
 bash proxy/http/1/test_fail_fast.sh    # 未设凭据 fail-fast（issue #1）
+bash proxy/http/1/test_websocket.sh    # WebSocket 握手 / 帧透传 / 非 101 透传
 bash proxy/lifecycle/test_lifecycle.sh # 优雅退出 / SO_REUSEADDR / idle timeout（issue #5）
 bash proxy/vpcli/test_cli.sh           # CLI 参数解析（issue #4）
 ```
