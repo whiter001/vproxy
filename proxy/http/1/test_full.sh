@@ -141,6 +141,19 @@ class EchoHandler(BaseHTTPRequestHandler):
         append_log(f"BODY_LEN {len(body)} MODE {mode}")
         self._write_json({"method": "POST", "mode": mode, "body_len": len(body), "headers": headers})
 
+    def do_HEAD(self):
+        # 测试 5 验证：proxy 对 HEAD 走单向 io.cp（upstream→client），不发 body。
+        # Python BaseHTTPRequestHandler 对 HEAD 不会自动调 wfile.write，所以这里
+        # 只 send_response + send_header，但 Content-Length 仍声明一个值——proxy 的
+        # io.cp 会把这部分 header（含 CL）转给客户端，但实际没 body bytes。
+        append_log("HEAD " + self.path)
+        body = b'{"method":"HEAD","path":"%s"}' % self.path.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        # 故意不写 body，验证 proxy 也不会因 io.cp 收不到 body 而异常
+
 
 class EchoTCPHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -277,5 +290,104 @@ sock.close()
 print("CONNECT OK")
 PY
 echo "✅ CONNECT 隧道可用"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 5: HEAD 请求 → 响应无 body ---"
+# proxy.1.v:286-288 对 HEAD 走单向 io.cp(upstream→client),不会把 body 回写。
+# upstream_servers.py 的 HEAD handler 返回 Content-Length: 11 但只发 header。
+python3 - <<PY
+import socket, base64
+s = socket.create_connection(("127.0.0.1", 5777), timeout=5)
+auth = base64.b64encode(b'testuser:testpass').decode()
+req = (
+    f"HEAD http://127.0.0.1:$HTTP_UPSTREAM_PORT/ HTTP/1.1\r\n"
+    f"Host: 127.0.0.1:$HTTP_UPSTREAM_PORT\r\n"
+    f"Proxy-Authorization: Basic {auth}\r\n"
+    f"Connection: close\r\n"
+    f"\r\n"
+).encode()
+s.sendall(req)
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = s.recv(4096)
+    if not chunk: break
+    resp += chunk
+s.settimeout(0.3)
+try:
+    extra = s.recv(4096)
+except socket.timeout:
+    extra = b""
+header_end = resp.find(b"\r\n\r\n")
+headers = resp[:header_end].decode(errors="replace")
+body_after_header = resp[header_end+4:] + extra
+assert "200 OK" in headers, f"expected 200, headers:\n{headers}"
+cl_line = [l for l in headers.split("\r\n") if l.lower().startswith("content-length:")]
+assert cl_line, f"missing Content-Length header:\n{headers}"
+cl_value = int(cl_line[0].split(":", 1)[1].strip())
+assert cl_value > 0, f"upstream declared Content-Length={cl_value}"
+assert len(body_after_header) == 0, f"HEAD should have no body, got {body_after_header!r}"
+print(f"  HEAD response: 200 OK, Content-Length={cl_value}, body=0 bytes")
+s.close()
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ HEAD 无 body 响应"
+else
+    echo "❌ HEAD 处理有 bug"
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 6: 畸形请求 → 400 Bad Request ---"
+# proxy.1.v:159-165 处理畸形首行（少于 3 段、超过 3 段、空首行等）。
+# 注：auth 检查在首行检查之前（proxy.1.v:186-196），所以畸形请求必须带
+# Proxy-Authorization 才能走到 400 路径，否则会被 407 拦截。
+python3 - <<'PY'
+import socket, base64
+auth = base64.b64encode(b'testuser:testpass').decode()
+
+def send_and_recv(payload):
+    s = socket.create_connection(("127.0.0.1", 5777), timeout=5)
+    s.sendall(payload)
+    resp = b""
+    s.settimeout(2)
+    try:
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk: break
+            resp += chunk
+    except socket.timeout:
+        pass
+    s.close()
+    return resp
+
+# 6a: 'GET foo\r\n'（2 段，缺 HTTP 版本）
+resp = send_and_recv(
+    f"GET foo\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode()
+)
+assert b"400 Bad Request" in resp, f"6a: expected 400, got {resp[:80]!r}"
+print(f"  6a 'GET foo' → 400 OK")
+
+# 6b: 仅 method 行，无 target 和 version（line 159 检查 first_parts.len < 3）
+# 注意：'GET foo bar baz qux' 是 5 parts，代理会尝试 dial foo:80 然后 502，
+# 所以这个用例不算畸形。
+resp = send_and_recv(
+    f"GET\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode()
+)
+assert b"400 Bad Request" in resp, f"6b: expected 400, got {resp[:80]!r}"
+print(f"  6b 'GET' (无 target/version) → 400 OK")
+
+# 6c: '\r\n'（空首行）
+resp = send_and_recv(
+    f"\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode()
+)
+assert b"400 Bad Request" in resp, f"6c: expected 400, got {resp[:80]!r}"
+print(f"  6c empty first line → 400 OK")
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ 畸形请求被拒"
+else
+    echo "❌ 畸形请求未返回 400"
+    failed=$((failed + 1))
+fi
 
 echo "--- 测试完成 ---"
