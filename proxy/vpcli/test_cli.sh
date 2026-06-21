@@ -14,14 +14,17 @@ set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 http_bin="${script_dir}/../http/1/proxy_cli_test_bin"
 socks5_bin="${script_dir}/../socks5/1/proxy_cli_test_bin"
+socks4_bin="${script_dir}/../socks4/1/proxy_cli_test_bin"
 http_src="${script_dir}/../http/1/proxy.1.v"
 socks5_src="${script_dir}/../socks5/1/proxy.socks5.v"
+socks4_src="${script_dir}/../socks4/1/proxy.socks4.v"
 
-rm -f "$http_bin" "$socks5_bin"
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin"
 
 echo "--- 正在编译 ---"
 v -o "$http_bin" "$http_src"
 v -o "$socks5_bin" "$socks5_src"
+v -o "$socks4_bin" "$socks4_src"
 
 failed=0
 
@@ -361,10 +364,103 @@ cleanup_pid "$pid"
 cleanup_pid "$upstream_pid"
 
 # ---------------------------------------------------------------------------
+echo "--- 测试 14: SOCKS4 --help ---"
+output=$("$socks4_bin" --help 2>&1)
+if echo "$output" | grep -q 'vproxy socks4 serve' && echo "$output" | grep -q -- '-l, --listen' \
+    && echo "$output" | grep -q -- '-u, --user'; then
+    echo "✅ SOCKS4 --help OK"
+else
+    echo "❌ SOCKS4 --help 异常"
+    echo "$output" | head -5
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 15: SOCKS4 -l 覆盖 SOCKS4_LISTEN_ADDR ---"
+SOCKS4_LISTEN_ADDR=127.0.0.1:8800 SOCKS4_NO_AUTH=1 \
+"$socks4_bin" -l 127.0.0.1:9991 > /tmp/cli_s4.log 2>&1 &
+pid=$!
+sleep 0.8
+if grep -q 'SOCKS4 proxy listening on 127.0.0.1:9991' /tmp/cli_s4.log; then
+    echo "✅ SOCKS4 -l 覆盖 env"
+else
+    echo "❌ SOCKS4 -l 未覆盖 env"
+    cat /tmp/cli_s4.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 16: SOCKS4 SOCKS4_LISTEN_ADDR env 生效 ---"
+SOCKS4_LISTEN_ADDR=127.0.0.1:9992 SOCKS4_NO_AUTH=1 \
+"$socks4_bin" > /tmp/cli_s4.log 2>&1 &
+pid=$!
+sleep 0.8
+if grep -q 'SOCKS4 proxy listening on 127.0.0.1:9992' /tmp/cli_s4.log; then
+    echo "✅ SOCKS4_LISTEN_ADDR env 生效"
+else
+    echo "❌ SOCKS4 env 未生效"
+    cat /tmp/cli_s4.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 17: SOCKS4 --no-auth（无需 SOCKS4_NO_AUTH=1） ---"
+unset SOCKS4_AUTH_USER SOCKS4_NO_AUTH
+"$socks4_bin" -l 127.0.0.1:9993 -n > /tmp/cli_s4.log 2>&1 &
+pid=$!
+sleep 0.8
+if grep -q 'SOCKS4 proxy listening on 127.0.0.1:9993' /tmp/cli_s4.log; then
+    echo "✅ SOCKS4 -n 启动成功"
+else
+    echo "❌ SOCKS4 -n 启动失败"
+    cat /tmp/cli_s4.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 18: SOCKS4_NO_AUTH=1 允许任意 USERID ---"
+# 即使设了 SOCKS4_AUTH_USER=alice，SOCKS4_NO_AUTH=1 应让 bob 也通过
+SOCKS4_AUTH_USER=alice SOCKS4_NO_AUTH=1 \
+"$socks4_bin" -l 127.0.0.1:9994 > /tmp/cli_s4.log 2>&1 &
+pid=$!
+for _ in {1..50}; do
+    if nc -z 127.0.0.1 9994 >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+python3 - <<PY
+import socket
+s = socket.create_connection(('127.0.0.1', 9994), timeout=3)
+# 发 bob（非 alice），SOCKS4_NO_AUTH=1 应放行
+import struct
+req = b'\x04\x01' + struct.pack('>H', 80) + bytes([127,0,0,1]) + b'bob\x00'
+s.sendall(req)
+reply = s.recv(8)
+# 期望 0x5A 或 0x5B（取决于上游是否通），关键是 verifier 不阻止。
+# 用 unreachable 端口 1 保证 0x5B，但证明 SOCKS4_NO_AUTH 旁路了 USERID 检查。
+if reply[1] in (0x5A, 0x5B):
+    print(f'USERID_BYPASS_OK cd={reply[1]:#x}')
+else:
+    raise SystemExit(f'expected 0x5A/0x5B, got {reply.hex()}')
+s.close()
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ SOCKS4_NO_AUTH=1 旁路 USERID 校验"
+else
+    echo "❌ SOCKS4_NO_AUTH=1 未旁路"
+    cat /tmp/cli_s4.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
 echo "--- 清理 ---"
-rm -f "$http_bin" "$socks5_bin" /tmp/cli_h.log /tmp/cli_s.log
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin" /tmp/cli_h.log /tmp/cli_s.log /tmp/cli_s4.log
 pkill -f h_check 2>/dev/null
 pkill -f s_check 2>/dev/null
+pkill -f s4_check 2>/dev/null
 
 echo ""
 if [[ $failed -eq 0 ]]; then

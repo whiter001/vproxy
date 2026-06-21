@@ -33,3 +33,7 @@ proxy/vpcli/cli_test_log
 *.dylib
 *.out
 *.test
+
+# mproxy build artifacts
+proxy/mproxy/1/*_test_bin
+proxy/mproxy/socks5_dial/*.dylib

@@ -15,19 +15,23 @@ set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 http_src="${script_dir}/../http/1/proxy.1.v"
 socks5_src="${script_dir}/../socks5/1/proxy.socks5.v"
+socks4_src="${script_dir}/../socks4/1/proxy.socks4.v"
 http_bin="${script_dir}/http_lifecycle_bin"
 socks5_bin="${script_dir}/socks5_lifecycle_bin"
+socks4_bin="${script_dir}/socks4_lifecycle_bin"
 http_log="${script_dir}/http_lifecycle.log"
 socks5_log="${script_dir}/socks5_lifecycle.log"
+socks4_log="${script_dir}/socks4_lifecycle.log"
 listen_addr="127.0.0.1:5780"
 auth_user="lcuser"
 auth_pass="lcpass"
 
-rm -f "$http_bin" "$socks5_bin" "$http_log" "$socks5_log"
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin" "$http_log" "$socks5_log" "$socks4_log"
 
 echo "--- 正在编译 ---"
 v -o "$http_bin" "$http_src"
 v -o "$socks5_bin" "$socks5_src"
+v -o "$socks4_bin" "$socks4_src"
 
 failed=0
 
@@ -265,8 +269,70 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "--- 测试 6: SOCKS4 SIGTERM 优雅退出 ---"
+SOCKS4_LISTEN_ADDR="127.0.0.1:5782" \
+SOCKS4_IDLE_TIMEOUT=300 \
+"$socks4_bin" > "$socks4_log" 2>&1 &
+socks4_pid=$!
+wait_port 5782 || { echo "❌ SOCKS4 proxy 未监听"; cat "$socks4_log"; failed=$((failed+1)); }
+sleep 0.2
+kill -TERM "$socks4_pid"
+for _ in {1..30}; do
+    if ! kill -0 "$socks4_pid" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+if kill -0 "$socks4_pid" 2>/dev/null; then
+    echo "❌ SOCKS4 proxy 没在 3s 内退出"
+    kill -KILL "$socks4_pid" 2>/dev/null
+    failed=$((failed+1))
+else
+    wait "$socks4_pid" || rc=$?
+    rc=${rc:-0}
+    if [[ $rc -eq 0 ]] && grep -q "shutdown:" "$socks4_log"; then
+        echo "✅ SOCKS4 SIGTERM 退出码 0 + drain 日志"
+    else
+        echo "❌ SOCKS4 退出异常 rc=$rc"
+        cat "$socks4_log"
+        failed=$((failed+1))
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 7: SOCKS4 idle timeout —— 静默 SOCKS4 客户端在 ~2s 被关闭 ---"
+# 验证 lifecycle.apply_idle_timeout 在 SOCKS4 路径生效:客户端连接后不发
+# 任何数据,代理的 read 应该在 ~2s 后超时,parse_request 返回 error,关闭。
+SOCKS4_LISTEN_ADDR="127.0.0.1:5782" \
+SOCKS4_NO_AUTH=1 \
+SOCKS4_IDLE_TIMEOUT=2 \
+"$socks4_bin" > "$socks4_log" 2>&1 &
+socks4_pid=$!
+wait_port 5782 || { echo "❌ SOCKS4 proxy 未监听"; cat "$socks4_log"; failed=$((failed+1)); }
+
+# 用 bash /dev/tcp 起一个 TCP 连接,不发任何字节
+exec 9<>/dev/tcp/127.0.0.1/5782 || true
+sleep 4  # 超过 idle=2s
+
+# 期望代理在 ~2s 后关闭连接,read 返回 EOF
+timeout_bytes=$(timeout 2 cat <&9 2>/dev/null | wc -c | tr -d ' ')
+exec 9<&- 2>/dev/null || true
+exec 9>&- 2>/dev/null || true
+
+# SOCKS4 idle 客户端不发数据,代理读 8 字节 header 会超时,日志含 'header too short'
+# 或 'read header' 错误,且 'Client handled in ~2s' 出现
+if [[ "$timeout_bytes" -eq 0 ]] && grep -qE 'Client handled in [12]\.' "$socks4_log"; then
+    echo "✅ SOCKS4 idle 客户端在 ~2s 后被关闭（读到 ${timeout_bytes} 字节 EOF,日志含 ~2s 处理记录）"
+else
+    echo "❌ SOCKS4 idle timeout 行为异常：读到 ${timeout_bytes} 字节,日志："
+    cat "$socks4_log"
+    failed=$((failed+1))
+fi
+
+kill -TERM "$socks4_pid"
+wait "$socks4_pid" 2>/dev/null
+
+# ---------------------------------------------------------------------------
 echo "--- 清理 ---"
-rm -f "$http_bin" "$socks5_bin" "$http_log" "$socks5_log"
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin" "$http_log" "$socks5_log" "$socks4_log"
 
 echo ""
 if [[ $failed -eq 0 ]]; then
