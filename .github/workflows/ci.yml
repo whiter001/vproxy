@@ -35,13 +35,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        proxy: [http, socks5]
+        proxy: [http, socks5, socks4]
         target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
         include:
           - proxy: http
             src: proxy/http/1/proxy.1.v
           - proxy: socks5
             src: proxy/socks5/1/proxy.socks5.v
+          - proxy: socks4
+            src: proxy/socks4/1/proxy.socks4.v
           - target: windows-x86_64
             os: windows-latest
             bin_ext: .exe
@@ -122,9 +124,40 @@ jobs:
             || { kill $SOCKS5_PID 2>/dev/null; exit 1; }
           kill $SOCKS5_PID 2>/dev/null || true
 
+          # Test SOCKS4 proxy（无认证模式；USERID 由 curl 隐式填 'curl'）
+          v run proxy/socks4/1/proxy.socks4.v &
+          SOCKS4_PID=$!
+          sleep 3
+          curl --fail --silent --show-error \
+            --socks4 127.0.0.1:5779 https://httpbin.org/get \
+            || { kill $SOCKS4_PID 2>/dev/null; exit 1; }
+          kill $SOCKS4_PID 2>/dev/null || true
+
+  test-websocket:
+    runs-on: ubuntu-latest
+    needs: format
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      # WebSocket 协议 + SOCKS4 + lifecycle + CLI 解析（全部本地，无外网依赖）
+      - name: Run integration tests (no network)
+        shell: bash
+        run: |
+          bash proxy/http/1/test_websocket.sh
+          bash proxy/socks4/1/test_protocol.sh
+          bash proxy/lifecycle/test_lifecycle.sh
+          bash proxy/vpcli/test_cli.sh
+
   release:
     runs-on: ubuntu-latest
-    needs: [test, build]
+    needs: [test, test-websocket, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
