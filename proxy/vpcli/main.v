@@ -58,6 +58,22 @@ pub mut:
 	show_version bool
 }
 
+// SOCKS4 代理配置（RFC 1928 之外的 SOCKS4 / SOCKS4a，无 subnegotiation）。
+// auth_user 为期望的 USERID；no_auth=true 时跳过 USERID 校验。
+// SOCKS4 无独立 password 字段（USERID 仅作标识），SOCKS4a 不要求 identd。
+pub struct Socks4Config {
+pub mut:
+	listen_addr  string
+	auth_user    string
+	no_auth      bool
+	idle_timeout time.Duration
+	log_format   string
+	log_level    string
+	config_file  string
+	show_help    bool
+	show_version bool
+}
+
 // 块作用：解析 HTTP 代理命令行参数
 // 处理问题（issue #4）：
 // 1. 子命令分发：`serve`（默认）/ `--help` / `--version`
@@ -190,6 +206,69 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 	}
 }
 
+// 块作用：解析 SOCKS4 代理命令行参数
+// 处理问题（issue #4）：CLI > env > default 三级优先级，子命令分发同 SOCKS5。
+// 与 SOCKS5 不同：SOCKS4 无 password 字段（USERID 仅作标识），auth 语义为「USERID 必须匹配」。
+pub fn parse_socks4_args(args []string) !Socks4Config {
+	rest, sub_error := strip_executable_and_subcommand(args)
+	if sub_error != '' {
+		return error(sub_error)
+	}
+
+	mut fp := flag.new_flag_parser(rest)
+	fp.application('vproxy socks4 serve')
+	fp.version(version)
+	fp.description('V-language SOCKS4 / SOCKS4a proxy (CONNECT + USERID match)')
+
+	listen := fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or {
+		''
+	}
+	user := fp.string_opt('user', `u`, 'expected USERID (empty = accept any)', flag.FlagConfig{
+		val_desc: 'name'
+	}) or { '' }
+	no_auth := fp.bool_opt('no-auth', `n`, 'skip USERID validation entirely', flag.FlagConfig{}) or {
+		false
+	}
+	config_file := fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+		val_desc: 'path'
+	}) or { '' }
+	log_format := fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{
+		val_desc: 'fmt'
+	}) or { 'text' }
+	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
+		val_desc: 'lvl'
+	}) or { 'info' }
+	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
+	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
+		false
+	}
+
+	fp.finalize() or { return error(err.msg()) }
+
+	final_listen := if listen != '' { listen } else { os.getenv_opt('SOCKS4_LISTEN_ADDR') or {
+			':5779'} }
+	final_user := if user != '' { user } else { os.getenv_opt('SOCKS4_AUTH_USER') or { '' } }
+
+	mut final_no_auth := false
+	if no_auth {
+		final_no_auth = true
+	} else if os.getenv_opt('SOCKS4_NO_AUTH') or { '' } == '1' {
+		final_no_auth = true
+	}
+
+	return Socks4Config{
+		listen_addr:  final_listen
+		auth_user:    final_user
+		no_auth:      final_no_auth
+		idle_timeout: parse_idle_timeout('SOCKS4_IDLE_TIMEOUT', 300)
+		log_format:   log_format
+		log_level:    log_level
+		config_file:  config_file
+		show_help:    show_help
+		show_version: show_version
+	}
+}
+
 // 块作用：剥离 os.args 的 exe 路径和子命令
 // 处理问题：flag.FlagParser 默认假设 args[0] 是 exe，不能再调 skip_executable()。
 // 我们手动 strip 掉 exe + 可能的子命令（`serve`），剩下的就是纯 flag 数组。
@@ -253,6 +332,31 @@ pub fn print_socks5_help() {
 	fp.string_opt('user', `u`, 'username', flag.FlagConfig{ val_desc: 'name' }) or { '' }
 	fp.string_opt('pass', `p`, 'password', flag.FlagConfig{ val_desc: 'pwd' }) or { '' }
 	fp.bool_opt('no-auth', `n`, 'disable authentication', flag.FlagConfig{}) or { false }
+	fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+		val_desc: 'path'
+	}) or { '' }
+	fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{ val_desc: 'fmt' }) or {
+		''
+	}
+	fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
+		val_desc: 'lvl'
+	}) or { '' }
+	fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
+	fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }
+	fp.finalize() or {}
+	println(fp.usage())
+}
+
+pub fn print_socks4_help() {
+	mut fp := flag.new_flag_parser([]string{})
+	fp.application('vproxy socks4 serve')
+	fp.version(version)
+	fp.description('V-language SOCKS4 / SOCKS4a proxy (CONNECT + USERID match)')
+	fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or { '' }
+	fp.string_opt('user', `u`, 'expected USERID (empty = accept any)', flag.FlagConfig{
+		val_desc: 'name'
+	}) or { '' }
+	fp.bool_opt('no-auth', `n`, 'skip USERID validation entirely', flag.FlagConfig{}) or { false }
 	fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
