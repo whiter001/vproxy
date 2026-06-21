@@ -15,19 +15,23 @@ set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 http_src="${script_dir}/../http/1/proxy.1.v"
 socks5_src="${script_dir}/../socks5/1/proxy.socks5.v"
+socks4_src="${script_dir}/../socks4/1/proxy.socks4.v"
 http_bin="${script_dir}/http_lifecycle_bin"
 socks5_bin="${script_dir}/socks5_lifecycle_bin"
+socks4_bin="${script_dir}/socks4_lifecycle_bin"
 http_log="${script_dir}/http_lifecycle.log"
 socks5_log="${script_dir}/socks5_lifecycle.log"
+socks4_log="${script_dir}/socks4_lifecycle.log"
 listen_addr="127.0.0.1:5780"
 auth_user="lcuser"
 auth_pass="lcpass"
 
-rm -f "$http_bin" "$socks5_bin" "$http_log" "$socks5_log"
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin" "$http_log" "$socks5_log" "$socks4_log"
 
 echo "--- 正在编译 ---"
 v -o "$http_bin" "$http_src"
 v -o "$socks5_bin" "$socks5_src"
+v -o "$socks4_bin" "$socks4_src"
 
 failed=0
 
@@ -265,8 +269,37 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "--- 测试 6: SOCKS4 SIGTERM 优雅退出 ---"
+SOCKS4_LISTEN_ADDR="127.0.0.1:5782" \
+SOCKS4_IDLE_TIMEOUT=300 \
+"$socks4_bin" > "$socks4_log" 2>&1 &
+socks4_pid=$!
+wait_port 5782 || { echo "❌ SOCKS4 proxy 未监听"; cat "$socks4_log"; failed=$((failed+1)); }
+sleep 0.2
+kill -TERM "$socks4_pid"
+for _ in {1..30}; do
+    if ! kill -0 "$socks4_pid" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+if kill -0 "$socks4_pid" 2>/dev/null; then
+    echo "❌ SOCKS4 proxy 没在 3s 内退出"
+    kill -KILL "$socks4_pid" 2>/dev/null
+    failed=$((failed+1))
+else
+    wait "$socks4_pid" || rc=$?
+    rc=${rc:-0}
+    if [[ $rc -eq 0 ]] && grep -q "shutdown:" "$socks4_log"; then
+        echo "✅ SOCKS4 SIGTERM 退出码 0 + drain 日志"
+    else
+        echo "❌ SOCKS4 退出异常 rc=$rc"
+        cat "$socks4_log"
+        failed=$((failed+1))
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 echo "--- 清理 ---"
-rm -f "$http_bin" "$socks5_bin" "$http_log" "$socks5_log"
+rm -f "$http_bin" "$socks5_bin" "$socks4_bin" "$http_log" "$socks5_log" "$socks4_log"
 
 echo ""
 if [[ $failed -eq 0 ]]; then
