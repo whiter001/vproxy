@@ -4,6 +4,8 @@
 
 set -u
 
+failed=0
+
 PROXY_BINARY="./proxy.1"
 V_SOURCE="proxy.1.v"
 PORT=5777
@@ -51,7 +53,8 @@ assert_eq() {
     if [ "$expected" = "$actual" ]; then
         echo "✅ $message"
     else
-        echo "❌ $message: 期望 $expected，实际 $actual"
+        echo "❌ $message: 期望 ${expected}，实际 ${actual}"
+        failed=$((failed + 1))
         return 1
     fi
 }
@@ -212,19 +215,19 @@ STATUS=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" \
 assert_eq "200" "$STATUS" "带认证 GET 请求成功"
 if grep -q "Proxy-Authorization:" "$UPSTREAM_LOG"; then
     echo "❌ 上游仍然看到了 Proxy-Authorization"
-    exit 1
+    failed=$((failed + 1))
 fi
 if grep -q "Proxy-Connection:" "$UPSTREAM_LOG"; then
     echo "❌ 上游仍然看到了 Proxy-Connection"
-    exit 1
+    failed=$((failed + 1))
 fi
 if ! grep -q "HEADER Via: 1.1 v-proxy" "$UPSTREAM_LOG"; then
     echo "❌ 上游没有看到 Via 头"
-    exit 1
+    failed=$((failed + 1))
 fi
 if ! grep -q "HEADER Proxy-Agent: V-Proxy/1.0" "$UPSTREAM_LOG"; then
     echo "❌ 上游没有看到 Proxy-Agent 头"
-    exit 1
+    failed=$((failed + 1))
 fi
 echo "✅ 上游未收到代理泄露头部，且看到了 Via / Proxy-Agent"
 
@@ -244,7 +247,7 @@ assert_eq "200" "$STATUS" "Chunked POST 成功"
 if ! grep -q "BODY_LEN 65536 MODE chunked" "$UPSTREAM_LOG"; then
     echo "❌ 上游没有正确收到 chunked 请求体"
     cat "$UPSTREAM_LOG"
-    exit 1
+    failed=$((failed + 1))
 fi
 echo "✅ Chunked 请求体被上游正确接收"
 
@@ -289,7 +292,12 @@ if echo != payload:
 sock.close()
 print("CONNECT OK")
 PY
-echo "✅ CONNECT 隧道可用"
+if [[ $? -eq 0 ]]; then
+    echo "✅ CONNECT 隧道可用"
+else
+    echo "❌ CONNECT 隧道不可用"
+    failed=$((failed + 1))
+fi
 
 # ---------------------------------------------------------------------------
 echo "--- 测试 5: HEAD 请求 → 响应无 body ---"
@@ -391,3 +399,11 @@ else
 fi
 
 echo "--- 测试完成 ---"
+
+if [[ $failed -eq 0 ]]; then
+    echo "=== All tests PASSED ==="
+    exit 0
+else
+    echo "=== $failed test(s) FAILED ==="
+    exit 1
+fi
