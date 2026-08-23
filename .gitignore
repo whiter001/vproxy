@@ -19,6 +19,8 @@ proxy/http/1/proxy.1.exe
 proxy/http/1/proxy_test_bin
 proxy/http/1/proxy_fail_fast_bin
 proxy/http/1/proxy_cli_test_bin
+# V 0.5.x v3 后端在源码目录生成的临时编译缓存目录（形如 .<binary>.v3cc.<hash>/）
+*.v3cc.*
 proxy/lifecycle/http_lifecycle_bin
 proxy/lifecycle/socks5_lifecycle_bin
 proxy/socks5/1/proxy.socks5
@@ -37,3 +39,9 @@ proxy/vpcli/cli_test_log
 # mproxy build artifacts
 proxy/mproxy/1/*_test_bin
 proxy/mproxy/socks5_dial/*.dylib
+
+# AgentFlow runner 内部产物（last-lint.log / pr-report.md 等），禁止 commit
+.agentflow/
+
+# Playwright MCP 页面快照（runner 的 playwright_verify 运行产物），禁止 commit
+.playwright-mcp/

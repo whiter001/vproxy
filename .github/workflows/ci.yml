@@ -100,44 +100,18 @@ jobs:
         with:
           check-latest: true
 
-      - name: Run integration tests
+      - name: Run V unit tests
         shell: bash
         run: |
-          # issue #1 / #15：HTTP 代理要求显式凭据；未设置会 fail-fast
-          # 同时这些 env 也被 main 通过 vpcli 解析，必须 export 而不是 bash 局部变量
-          export PROXY_AUTH_USER=user
-          export PROXY_AUTH_PASS=pwd
-          export SOCKS5_AUTH_USERNAME=user
-          export SOCKS5_AUTH_PASSWORD=pwd
+          v test proxy/http/1 proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle
 
-          # Test HTTP proxy
-          v run proxy/http/1/proxy.1.v &
-          HTTP_PID=$!
-          sleep 3
-          curl --fail --silent --show-error \
-            --proxy-user "${PROXY_AUTH_USER}:${PROXY_AUTH_PASS}" \
-            -x 127.0.0.1:5777 https://httpbin.org/get \
-            || { kill $HTTP_PID 2>/dev/null; exit 1; }
-          kill $HTTP_PID 2>/dev/null || true
-
-          # Test SOCKS5 proxy
-          v run proxy/socks5/1/proxy.socks5.v &
-          SOCKS5_PID=$!
-          sleep 3
-          curl --fail --silent --show-error \
-            --proxy-user "${SOCKS5_AUTH_USERNAME}:${SOCKS5_AUTH_PASSWORD}" \
-            --socks5 127.0.0.1:5778 https://httpbin.org/get \
-            || { kill $SOCKS5_PID 2>/dev/null; exit 1; }
-          kill $SOCKS5_PID 2>/dev/null || true
-
-          # Test SOCKS4 proxy（无认证模式；USERID 由 curl 隐式填 'curl'）
-          v run proxy/socks4/1/proxy.socks4.v &
-          SOCKS4_PID=$!
-          sleep 3
-          curl --fail --silent --show-error \
-            --socks4 127.0.0.1:5779 https://httpbin.org/get \
-            || { kill $SOCKS4_PID 2>/dev/null; exit 1; }
-          kill $SOCKS4_PID 2>/dev/null || true
+      # 真网 E2E（HTTP / SOCKS5 / SOCKS4 → httpbin.org），替换原内联 curl 用例，
+      # 覆盖更全（含无鉴权/错误凭据 → 407、SOCKS5 错误凭据拒绝）。
+      # REQUIRE_NET=1：httpbin 不可达时硬失败（对齐原内联用例的严格语义）。
+      - name: Run real-network tests (httpbin.org)
+        shell: bash
+        run: |
+          REQUIRE_NET=1 bash scripts/test_real.sh
 
   test-websocket:
     runs-on: ubuntu-latest
