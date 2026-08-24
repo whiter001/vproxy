@@ -180,14 +180,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		if line == '' {
 			continue
 		}
-		lower := line.to_lower()
-		if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:') {
+		if starts_with_ci(line, 'proxy-authorization:') || starts_with_ci(line, 'authorization:') {
 			proxy_authorization = line.all_after(':').trim_space()
-		} else if lower.starts_with('host:') {
+		} else if starts_with_ci(line, 'host:') {
 			host_header = line.all_after(':').trim_space()
-		} else if lower.starts_with('upgrade:') {
+		} else if starts_with_ci(line, 'upgrade:') {
 			upgrade_value = line.all_after(':').trim_space().to_lower()
-		} else if lower.starts_with('connection:') {
+		} else if starts_with_ci(line, 'connection:') {
 			connection_value = line.all_after(':').trim_space().to_lower()
 		}
 	}
@@ -291,12 +290,12 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			if line == '' {
 				continue
 			}
-			lower := line.to_lower()
-			if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:')
-				|| lower.starts_with('proxy-connection:') {
+			if starts_with_ci(line, 'proxy-authorization:')
+				|| starts_with_ci(line, 'authorization:')
+				|| starts_with_ci(line, 'proxy-connection:') {
 				continue
 			}
-			if lower.starts_with('host:') {
+			if starts_with_ci(line, 'host:') {
 				has_host_header = true
 			}
 			ws_headers << line
@@ -365,26 +364,25 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		relay_both_ways(mut socket, mut upstream)
 		return
 	} else {
-		// Parse headers from header_str
-		header_str_lines := header_str.split('\r\n')
+		// 复用上面已 split 的 header_lines，避免对同一 header 重复 split
 		mut forwarded_headers := []string{}
 		forwarded_headers << forwarded_first_line
 
 		mut has_host_header := false
-		for i, line in header_str_lines {
+		for i, line in header_lines {
 			if i == 0 {
 				continue // 忽略第一行（请求行），已在 forwarded_first_line 处理
 			}
 			if line == '' {
 				continue // 忽略空行
 			}
-			lower := line.to_lower()
 			// 移除代理相关的头部，防止循环代理或泄露验证信息
-			if lower.starts_with('proxy-authorization:') || lower.starts_with('authorization:')
-				|| lower.starts_with('proxy-connection:') {
+			if starts_with_ci(line, 'proxy-authorization:')
+				|| starts_with_ci(line, 'authorization:')
+				|| starts_with_ci(line, 'proxy-connection:') {
 				continue
 			}
-			if lower.starts_with('host:') {
+			if starts_with_ci(line, 'host:') {
 				has_host_header = true
 			}
 			forwarded_headers << line
@@ -498,6 +496,25 @@ fn normalize_authority(authority string, default_port string) string {
 		result += default_port
 	}
 	return result
+}
+
+// 块作用：无分配的大小写不敏感前缀比较（仅处理 ASCII A-Z）
+// 处理问题：HTTP 头名为 ASCII；等价于 `line.to_lower().starts_with(prefix)`，
+// 但不产生 `to_lower()` 的中间字符串分配（每行一次，热路径上值得省）。
+fn starts_with_ci(line string, prefix string) bool {
+	if line.len < prefix.len {
+		return false
+	}
+	for i in 0 .. prefix.len {
+		mut c := line[i]
+		if c >= `A` && c <= `Z` {
+			c = c + 32
+		}
+		if c != prefix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 fn send_simple_response(mut socket net.TcpConn, status_line string, message string) {

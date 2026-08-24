@@ -239,16 +239,19 @@ fn handle_client(mut socket net.TcpConn, remote string, stats &Stats, idle_dur t
 
 // 块作用：io.cp 的 XOR 包装版本——拷贝每批字节后 XOR ^ 1 再写出去
 // 处理问题：io.cp 内部走 Reader/Writer 接口，不能中途插入字节变换。
-// 手动循环 read → xor.apply → write。
+// 手动循环 read → xor.apply → write。缓冲在循环外分配一次，避免每迭代重复分配。
 fn xor_pipe(mut src net.TcpConn, mut dst net.TcpConn) ! {
+	mut buf := []u8{len: 4096}
 	for {
-		mut buf := []u8{len: 4096}
 		mut n := src.read(mut buf) or { return err }
 		if n <= 0 {
 			return
 		}
-		// 截取有效字节切片并 XOR ^ 1（复用 xor.apply 保证实现一致）
-		mut payload := buf[..n]
+		// 截取有效字节切片并 XOR ^ 1（复用 xor.apply 保证实现一致）。
+		// 必须用 unsafe 切片：`mut payload := buf[..n]` 会隐式 clone（每迭代一次
+		// 拷贝+分配），unsafe 切片零拷贝共享 buf 底层数组，配合循环外复用缓冲
+		// 才能彻底去掉每迭代的分配。
+		mut payload := unsafe { buf[..n] }
 		xor.apply(mut payload)
 		dst.write(payload) or { return err }
 	}
