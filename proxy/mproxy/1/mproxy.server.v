@@ -206,10 +206,12 @@ fn main() {
 // 处理问题：mproxy client 发送时 XOR ^ 1 编码，server 端需解码才能还原原始 HTTP。
 // 这里按 buffer 读取（4096B/批），不是 byte-by-byte，因为 V 0.5.x 的 socket.read
 // 在 len=1 时容易触发额外 accept/connection 行为。
+// 优化：每批先用 xor.apply 整块解码，再整块追加到 data，避免逐字节 `data << buf[i]`；
+// 缓冲在循环外分配一次。
 fn read_xor_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 	mut data := []u8{}
+	mut buf := []u8{len: 4096}
 	for {
-		mut buf := []u8{len: 4096}
 		mut n := socket.read(mut buf) or { return err }
 		if n <= 0 {
 			if data.len == 0 {
@@ -217,11 +219,11 @@ fn read_xor_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 			}
 			return error('incomplete request')
 		}
-		// 解码这一批字节
-		for i in 0 .. n {
-			buf[i] = buf[i] ^ 1
-			data << buf[i]
-		}
+		// 解码这一批字节（整块）。unsafe 切片零拷贝共享 buf 底层数组，
+		// 避免 `buf[..n]` 隐式 clone 的每迭代一次拷贝+分配。
+		mut payload := unsafe { buf[..n] }
+		xor.apply(mut payload)
+		data << payload
 		if data.len > max_header_size {
 			return error('Request too large')
 		}
@@ -385,6 +387,9 @@ fn encode_string(s string) []u8 {
 }
 
 // 块作用：io.cp 的 XOR 包装
+// 处理问题：缓冲在循环外分配一次复用；对 buf[..n] 原地 XOR 后写出，
+// 省去原 `buf[..n].clone()` 的每迭代一次拷贝+分配（下次 read 会覆盖旧数据，
+// 先完整写出本批再进入下次 read，无覆盖未写数据的问题）。
 fn xor_pipe(mut src net.TcpConn, mut dst net.TcpConn) ! {
 	mut buf := []u8{len: 8192}
 	for {
@@ -392,7 +397,7 @@ fn xor_pipe(mut src net.TcpConn, mut dst net.TcpConn) ! {
 		if n <= 0 {
 			return
 		}
-		mut payload := buf[..n].clone()
+		mut payload := unsafe { buf[..n] }
 		xor.apply(mut payload)
 		dst.write(payload) or { return err }
 	}
