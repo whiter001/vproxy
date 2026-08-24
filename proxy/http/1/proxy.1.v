@@ -362,27 +362,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			return
 		}
 		eprintln('WebSocket: 101 handshake OK, entering relay')
-
-		// 双向 io.cp 中继（与 CONNECT 相同的 close-on-error 模式）
-		mut wg := sync.new_waitgroup()
-		wg.add(2)
-		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
-			defer {
-				src.close() or {}
-				dst.close() or {}
-				wg.done()
-			}
-			io.cp(mut src, mut dst) or {}
-		}(mut socket, mut upstream, mut wg)
-		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
-			defer {
-				src.close() or {}
-				dst.close() or {}
-				wg.done()
-			}
-			io.cp(mut src, mut dst) or {}
-		}(mut upstream, mut socket, mut wg)
-		wg.wait()
+		relay_both_ways(mut socket, mut upstream)
 		return
 	} else {
 		// Parse headers from header_str
@@ -439,28 +419,36 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		// HEAD 响应没有 body，仅单向复制响应头
 		io.cp(mut upstream, mut socket) or {}
 	} else {
-		mut wg := sync.new_waitgroup()
-		wg.add(2)
-		// 协程 1: 客户端 -> 上游
-		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
-			defer {
-				src.close() or {}
-				dst.close() or {}
-				wg.done()
-			}
-			io.cp(mut src, mut dst) or {}
-		}(mut socket, mut upstream, mut wg)
-		// 协程 2: 上游 -> 客户端
-		go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
-			defer {
-				src.close() or {}
-				dst.close() or {}
-				wg.done()
-			}
-			io.cp(mut src, mut dst) or {}
-		}(mut upstream, mut socket, mut wg)
-		wg.wait()
+		relay_both_ways(mut socket, mut upstream)
 	}
+}
+
+// 块作用：双向 io.cp 中继（graceful teardown，单 owner close）
+// 处理问题：修复并发双 close 竞态（Connection reset / EBADF）。
+// 旧实现的两个 relay goroutine 各自 defer close(src)+close(dst)，同一 fd 会被并发
+// close 2~3 次；先 close 释放的 fd 号被 accept 复用给新连接后，第二个 close 会把
+// 新连接误关，高并发下必现。现在每个方向只对写目标 dst 做 TCP 半关闭
+// （net.shutdown(handle, how: .write)，发 FIN 但不释放 fd），让对端读到 EOF 后自行
+// 关闭，从而让另一方向的 io.cp 及时返回；两个 fd 的完整 close 由 handle_client 的
+// defer（socket）与 dial 后的 defer（upstream）各执行恰好一次，杜绝 fd 复用误关。
+fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn) {
+	mut wg := sync.new_waitgroup()
+	wg.add(2)
+	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+		defer {
+			net.shutdown(dst.sock.handle, how: .write)
+			wg.done()
+		}
+		io.cp(mut src, mut dst) or {}
+	}(mut a, mut b, mut wg)
+	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+		defer {
+			net.shutdown(dst.sock.handle, how: .write)
+			wg.done()
+		}
+		io.cp(mut src, mut dst) or {}
+	}(mut b, mut a, mut wg)
+	wg.wait()
 }
 
 // 块作用：目标解析

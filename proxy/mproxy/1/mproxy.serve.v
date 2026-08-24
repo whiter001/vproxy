@@ -371,22 +371,24 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, upstream_cfg socks5_dial.
 	}
 }
 
-// 块作用：双向 io.cp 中继（与 vproxy 模式一致）
+// 块作用：双向 io.cp 中继（graceful teardown，单 owner close）
+// 处理问题：与 vproxy 相同，修复并发双 close 竞态——两个 relay goroutine 不再 close fd，
+// 只对写目标 dst 半关闭（net.shutdown(handle, how: .write)，发 FIN 不释放 fd），让对端
+// 读到 EOF 自行关闭；socket 与 upstream 的完整 close 由 handle_client 的 defer 各执行
+// 恰好一次，杜绝 fd 复用被误关。
 fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn) {
 	wg := sync.new_waitgroup()
 	wg.add(2)
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		io.cp(mut src, mut dst) or {}
 	}(mut a, mut b, wg)
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		io.cp(mut src, mut dst) or {}
