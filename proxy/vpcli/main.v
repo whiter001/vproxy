@@ -2,7 +2,8 @@
 //
 // 命令行参数解析（issue #4）。
 //
-// 提供 HTTP / SOCKS5 代理的 CLI > env > default 三级优先级配置解析。
+// 提供 HTTP / SOCKS5 / SOCKS4 代理的 CLI > env > file > default 四级优先级配置解析
+// （file 层为 proxy.toml，见 toml_config.v，issue #6）。
 // 支持子命令 `serve`（默认）；未来扩展 `gen-ca` / `bench` 留口。
 //
 // 用法（HTTP）：
@@ -15,7 +16,8 @@
 // 注意：
 // - 本模块只解析标志；具体逻辑（如 `PROXY_REQUIRE_AUTH=0` 关闭鉴权）
 //   由调用方在拿到 Config 后处理。
-// - 配置文件 TOML 加载（issue #6）暂未实现，`--config` 参数保留为预留。
+// - 配置文件（`--config <path>` 或 CWD 下的 proxy.toml）加载失败一律 fail-fast；
+//   --help / --version 不加载配置文件。
 // - 模块名用 `vpcli` 而不是 `cli`，避免与 V 标准库的 cli 子命令框架撞名。
 // - 调用 flag.FlagParser 之前手动 strip 掉 exe + subcommand，**不**调用
 //   fp.skip_executable()，否则它会把第一个 flag 当成可执行路径删掉。
@@ -27,7 +29,7 @@ import time
 
 pub const version = '0.2.0'
 
-// HTTP 代理配置（CLI > env > default 三级优先级）
+// HTTP 代理配置（CLI > env > file > default 四级优先级）
 pub struct HttpConfig {
 pub mut:
 	listen_addr  string
@@ -38,6 +40,9 @@ pub mut:
 	idle_timeout time.Duration
 	log_format   string
 	log_level    string
+	metrics_addr string
+	allow_rules  []string
+	deny_rules   []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -53,6 +58,9 @@ pub mut:
 	idle_timeout time.Duration
 	log_format   string
 	log_level    string
+	metrics_addr string
+	allow_rules  []string
+	deny_rules   []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -69,6 +77,9 @@ pub mut:
 	idle_timeout time.Duration
 	log_format   string
 	log_level    string
+	metrics_addr string
+	allow_rules  []string
+	deny_rules   []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -99,15 +110,15 @@ pub fn parse_http_args(args []string) !HttpConfig {
 		val_desc: 'b64'
 	}) or { '' }
 	no_auth := fp.bool_opt('no-auth', `n`, 'disable authentication', flag.FlagConfig{}) or { false }
-	config_file := fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	config_file := fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	log_format := fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{
 		val_desc: 'fmt'
-	}) or { 'text' }
+	}) or { '' }
 	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
-	}) or { 'info' }
+	}) or { '' }
 	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
 		false
@@ -117,12 +128,48 @@ pub fn parse_http_args(args []string) !HttpConfig {
 	// 这里返回错误让调用方决定退出码
 	fp.finalize() or { return error(err.msg()) }
 
-	// 三级优先级：CLI > env > default
-	final_listen := if listen != '' { listen } else { os.getenv_opt('PROXY_LISTEN_ADDR') or {
-			':5777'} }
-	final_user := if user != '' { user } else { os.getenv_opt('PROXY_AUTH_USER') or { '' } }
-	final_pass := if pass != '' { pass } else { os.getenv_opt('PROXY_AUTH_PASS') or { '' } }
+	// 配置文件层：--config 显式指定 > CWD 下的 proxy.toml；--help/--version 不加载
+	file_cfg, resolved_cfg_path := load_file_layer(config_file, show_help || show_version)!
+
+	// 四级优先级：CLI > env > file > default
+	final_listen := if listen != '' {
+		listen
+	} else if os.getenv_opt('PROXY_LISTEN_ADDR') or { '' } != '' {
+		os.getenv_opt('PROXY_LISTEN_ADDR') or { '' }
+	} else if file_cfg.listen_addr != '' {
+		file_cfg.listen_addr
+	} else {
+		':5777'
+	}
+	final_user := if user != '' {
+		user
+	} else if os.getenv_opt('PROXY_AUTH_USER') or { '' } != '' {
+		os.getenv_opt('PROXY_AUTH_USER') or { '' }
+	} else {
+		file_cfg.auth_user
+	}
+	final_pass := if pass != '' {
+		pass
+	} else if os.getenv_opt('PROXY_AUTH_PASS') or { '' } != '' {
+		os.getenv_opt('PROXY_AUTH_PASS') or { '' }
+	} else {
+		file_cfg.auth_pass
+	}
 	final_basic := if basic != '' { basic } else { os.getenv_opt('PROXY_AUTH_BASIC') or { '' } }
+	final_log_format := if log_format != '' {
+		log_format
+	} else if file_cfg.log_format != '' {
+		file_cfg.log_format
+	} else {
+		'text'
+	}
+	final_log_level := if log_level != '' {
+		log_level
+	} else if file_cfg.log_level != '' {
+		file_cfg.log_level
+	} else {
+		'info'
+	}
 
 	mut require_auth := true
 	if no_auth {
@@ -137,10 +184,14 @@ pub fn parse_http_args(args []string) !HttpConfig {
 		auth_pass:    final_pass
 		auth_basic:   final_basic
 		require_auth: require_auth
-		idle_timeout: parse_idle_timeout('PROXY_IDLE_TIMEOUT', 300)
-		log_format:   log_format
-		log_level:    log_level
-		config_file:  config_file
+		idle_timeout: parse_idle_timeout_merged('PROXY_IDLE_TIMEOUT',
+			file_cfg.idle_timeout_seconds, 300)
+		log_format:   final_log_format
+		log_level:    final_log_level
+		metrics_addr: file_cfg.metrics_addr
+		allow_rules:  file_cfg.allow_rules
+		deny_rules:   file_cfg.deny_rules
+		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
 	}
@@ -164,15 +215,15 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 	user := fp.string_opt('user', `u`, 'username', flag.FlagConfig{ val_desc: 'name' }) or { '' }
 	pass := fp.string_opt('pass', `p`, 'password', flag.FlagConfig{ val_desc: 'pwd' }) or { '' }
 	no_auth := fp.bool_opt('no-auth', `n`, 'disable authentication', flag.FlagConfig{}) or { false }
-	config_file := fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	config_file := fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	log_format := fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{
 		val_desc: 'fmt'
-	}) or { 'text' }
+	}) or { '' }
 	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
-	}) or { 'info' }
+	}) or { '' }
 	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
 		false
@@ -180,10 +231,46 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 
 	fp.finalize() or { return error(err.msg()) }
 
-	final_listen := if listen != '' { listen } else { os.getenv_opt('SOCKS5_LISTEN_ADDR') or {
-			':5778'} }
-	final_user := if user != '' { user } else { os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' } }
-	final_pass := if pass != '' { pass } else { os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' } }
+	// 配置文件层：--config 显式指定 > CWD 下的 proxy.toml；--help/--version 不加载
+	file_cfg, resolved_cfg_path := load_file_layer(config_file, show_help || show_version)!
+
+	final_listen := if listen != '' {
+		listen
+	} else if os.getenv_opt('SOCKS5_LISTEN_ADDR') or { '' } != '' {
+		os.getenv_opt('SOCKS5_LISTEN_ADDR') or { '' }
+	} else if file_cfg.listen_addr != '' {
+		file_cfg.listen_addr
+	} else {
+		':5778'
+	}
+	final_user := if user != '' {
+		user
+	} else if os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' } != '' {
+		os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' }
+	} else {
+		file_cfg.auth_user
+	}
+	final_pass := if pass != '' {
+		pass
+	} else if os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' } != '' {
+		os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' }
+	} else {
+		file_cfg.auth_pass
+	}
+	final_log_format := if log_format != '' {
+		log_format
+	} else if file_cfg.log_format != '' {
+		file_cfg.log_format
+	} else {
+		'text'
+	}
+	final_log_level := if log_level != '' {
+		log_level
+	} else if file_cfg.log_level != '' {
+		file_cfg.log_level
+	} else {
+		'info'
+	}
 
 	mut final_no_auth := false
 	if no_auth {
@@ -197,17 +284,21 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 		auth_user:    final_user
 		auth_pass:    final_pass
 		no_auth:      final_no_auth
-		idle_timeout: parse_idle_timeout('SOCKS5_IDLE_TIMEOUT', 300)
-		log_format:   log_format
-		log_level:    log_level
-		config_file:  config_file
+		idle_timeout: parse_idle_timeout_merged('SOCKS5_IDLE_TIMEOUT',
+			file_cfg.idle_timeout_seconds, 300)
+		log_format:   final_log_format
+		log_level:    final_log_level
+		metrics_addr: file_cfg.metrics_addr
+		allow_rules:  file_cfg.allow_rules
+		deny_rules:   file_cfg.deny_rules
+		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
 	}
 }
 
 // 块作用：解析 SOCKS4 代理命令行参数
-// 处理问题（issue #4）：CLI > env > default 三级优先级，子命令分发同 SOCKS5。
+// 处理问题（issue #4）：CLI > env > file > default 四级优先级，子命令分发同 SOCKS5。
 // 与 SOCKS5 不同：SOCKS4 无 password 字段（USERID 仅作标识），auth 语义为「USERID 必须匹配」。
 pub fn parse_socks4_args(args []string) !Socks4Config {
 	rest, sub_error := strip_executable_and_subcommand(args)
@@ -229,15 +320,15 @@ pub fn parse_socks4_args(args []string) !Socks4Config {
 	no_auth := fp.bool_opt('no-auth', `n`, 'skip USERID validation entirely', flag.FlagConfig{}) or {
 		false
 	}
-	config_file := fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	config_file := fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	log_format := fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{
 		val_desc: 'fmt'
-	}) or { 'text' }
+	}) or { '' }
 	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
-	}) or { 'info' }
+	}) or { '' }
 	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
 		false
@@ -245,9 +336,39 @@ pub fn parse_socks4_args(args []string) !Socks4Config {
 
 	fp.finalize() or { return error(err.msg()) }
 
-	final_listen := if listen != '' { listen } else { os.getenv_opt('SOCKS4_LISTEN_ADDR') or {
-			':5779'} }
-	final_user := if user != '' { user } else { os.getenv_opt('SOCKS4_AUTH_USER') or { '' } }
+	// 配置文件层：--config 显式指定 > CWD 下的 proxy.toml；--help/--version 不加载
+	file_cfg, resolved_cfg_path := load_file_layer(config_file, show_help || show_version)!
+
+	final_listen := if listen != '' {
+		listen
+	} else if os.getenv_opt('SOCKS4_LISTEN_ADDR') or { '' } != '' {
+		os.getenv_opt('SOCKS4_LISTEN_ADDR') or { '' }
+	} else if file_cfg.listen_addr != '' {
+		file_cfg.listen_addr
+	} else {
+		':5779'
+	}
+	final_user := if user != '' {
+		user
+	} else if os.getenv_opt('SOCKS4_AUTH_USER') or { '' } != '' {
+		os.getenv_opt('SOCKS4_AUTH_USER') or { '' }
+	} else {
+		file_cfg.auth_user
+	}
+	final_log_format := if log_format != '' {
+		log_format
+	} else if file_cfg.log_format != '' {
+		file_cfg.log_format
+	} else {
+		'text'
+	}
+	final_log_level := if log_level != '' {
+		log_level
+	} else if file_cfg.log_level != '' {
+		file_cfg.log_level
+	} else {
+		'info'
+	}
 
 	mut final_no_auth := false
 	if no_auth {
@@ -260,10 +381,14 @@ pub fn parse_socks4_args(args []string) !Socks4Config {
 		listen_addr:  final_listen
 		auth_user:    final_user
 		no_auth:      final_no_auth
-		idle_timeout: parse_idle_timeout('SOCKS4_IDLE_TIMEOUT', 300)
-		log_format:   log_format
-		log_level:    log_level
-		config_file:  config_file
+		idle_timeout: parse_idle_timeout_merged('SOCKS4_IDLE_TIMEOUT',
+			file_cfg.idle_timeout_seconds, 300)
+		log_format:   final_log_format
+		log_level:    final_log_level
+		metrics_addr: file_cfg.metrics_addr
+		allow_rules:  file_cfg.allow_rules
+		deny_rules:   file_cfg.deny_rules
+		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
 	}
@@ -290,6 +415,27 @@ fn strip_executable_and_subcommand(args []string) ([]string, string) {
 	return rest, ''
 }
 
+// 解析配置文件层：--config 显式指定优先，未指定时仅当 CWD 存在 proxy.toml 才加载。
+// skip=true（--help/--version）时跳过加载，避免帮助/版本被坏配置挡掉。
+// 返回 (TomlConfig, 实际生效的配置路径)。
+fn load_file_layer(config_file string, skip bool) !(TomlConfig, string) {
+	if skip {
+		return TomlConfig{}, ''
+	}
+	cfg_path := if config_file != '' {
+		config_file
+	} else if os.exists('proxy.toml') {
+		'proxy.toml'
+	} else {
+		''
+	}
+	if cfg_path == '' {
+		return TomlConfig{}, ''
+	}
+	file_cfg := load_toml_config(cfg_path)!
+	return file_cfg, cfg_path
+}
+
 fn is_serve_or_help(s string) bool {
 	return s == 'serve' || s == '--help' || s == '-h' || s == '--version' || s == '-v'
 		|| s == 'help' || s == 'version'
@@ -308,7 +454,7 @@ pub fn print_http_help() {
 		val_desc: 'b64'
 	}) or { '' }
 	fp.bool_opt('no-auth', `n`, 'disable authentication', flag.FlagConfig{}) or { false }
-	fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{ val_desc: 'fmt' }) or {
@@ -332,7 +478,7 @@ pub fn print_socks5_help() {
 	fp.string_opt('user', `u`, 'username', flag.FlagConfig{ val_desc: 'name' }) or { '' }
 	fp.string_opt('pass', `p`, 'password', flag.FlagConfig{ val_desc: 'pwd' }) or { '' }
 	fp.bool_opt('no-auth', `n`, 'disable authentication', flag.FlagConfig{}) or { false }
-	fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{ val_desc: 'fmt' }) or {
@@ -357,7 +503,7 @@ pub fn print_socks4_help() {
 		val_desc: 'name'
 	}) or { '' }
 	fp.bool_opt('no-auth', `n`, 'skip USERID validation entirely', flag.FlagConfig{}) or { false }
-	fp.string_opt('config', `c`, 'config file (reserved for issue #6)', flag.FlagConfig{
+	fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
 		val_desc: 'path'
 	}) or { '' }
 	fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{ val_desc: 'fmt' }) or {
@@ -374,6 +520,26 @@ pub fn print_socks4_help() {
 
 fn parse_idle_timeout(env_var string, default_seconds int) time.Duration {
 	raw := os.getenv_opt(env_var) or { return time.Duration(default_seconds) * time.second }
+	secs := raw.int()
+	if secs <= 0 {
+		return time.infinite
+	}
+	return time.Duration(secs) * time.second
+}
+
+// 四级优先级的 idle timeout：env > file > default。file_seconds 为 none 表示文件未设置。
+// env / file 的 0 或负值都表示禁用（time.infinite），与旧版 env 语义一致。
+fn parse_idle_timeout_merged(env_var string, file_seconds ?int, default_seconds int) time.Duration {
+	raw := os.getenv_opt(env_var) or {
+		if file_seconds != none {
+			secs := file_seconds
+			if secs <= 0 {
+				return time.infinite
+			}
+			return time.Duration(secs) * time.second
+		}
+		return time.Duration(default_seconds) * time.second
+	}
 	secs := raw.int()
 	if secs <= 0 {
 		return time.infinite

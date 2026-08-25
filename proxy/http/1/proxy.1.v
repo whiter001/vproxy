@@ -49,6 +49,24 @@ fn main() {
 		C.exit(1)
 	}
 
+	if cfg.config_file != '' {
+		eprintln('Config loaded from ${cfg.config_file}')
+	}
+	// 打印生效配置：password / auth_basic 一律打码，避免敏感信息进启动日志
+	vpcli.print_effective_config(vpcli.EffectiveConfig{
+		label:        'http'
+		listen_addr:  cfg.listen_addr
+		auth_user:    cfg.auth_user
+		auth_pass:    cfg.auth_pass
+		auth_basic:   cfg.auth_basic
+		log_level:    cfg.log_level
+		log_format:   cfg.log_format
+		metrics_addr: cfg.metrics_addr
+		idle_timeout: cfg.idle_timeout
+		allow_rules:  cfg.allow_rules
+		deny_rules:   cfg.deny_rules
+	})
+
 	lifecycle.install_signal_handlers()
 	idle_dur := cfg.idle_timeout
 
