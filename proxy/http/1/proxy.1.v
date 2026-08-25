@@ -1,10 +1,10 @@
 module main
 
 import encoding.base64
-import io
 import lifecycle
 import net
 import os
+import strings
 import sync
 import sync.stdatomic
 import time
@@ -17,8 +17,14 @@ const default_https_port = ':443'
 
 struct Stats {
 mut:
-	active_conns i64
-	inflight     sync.WaitGroup // 跟踪在飞连接，用于优雅退出（issue #5）
+	active_conns                  i64
+	connections_ok_total          i64            // 成功建立转发/隧道的连接累计
+	errors_auth_failed_total      i64            // 鉴权失败累计
+	errors_upstream_connect_total i64            // 上游连接失败累计
+	errors_idle_timeout_total     i64            // idle timeout 累计（读超时）
+	bytes_in                      i64            // 客户端 → 上游 转发字节累计
+	bytes_out                     i64            // 上游 → 客户端 转发字节累计
+	inflight                      sync.WaitGroup // 跟踪在飞连接，用于优雅退出（issue #5）
 }
 
 // 块作用：入口函数
@@ -63,6 +69,9 @@ fn main() {
 	eprintln('Listen on ${cfg.listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
+	if cfg.metrics_addr != '' {
+		go metrics_server(cfg.metrics_addr, stats)
+	}
 	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
 	server.set_accept_timeout(1 * time.second)
 	for {
@@ -122,6 +131,86 @@ fn proxy_auth_config(auth_basic string, user string, pass string, require_auth b
 	return base64.encode_str('${user}:${pass}'), true
 }
 
+// 块作用：Prometheus /metrics 文本渲染
+// 处理问题：把 Stats 原子计数转成 Prometheus 文本格式（HELP/TYPE/采样行）。
+// proto 固定为 "http"（本代理语义）；所有值用 stdatomic.load_i64 原子读，避免与
+// 各 handle_client goroutine 的 add_i64 竞争。输出以换行结尾。
+fn render_metrics(stats &Stats) string {
+	mut sb := strings.new_builder(512)
+	sb.write_string('# HELP vproxy_active_conns 当前活跃连接数\n')
+	sb.write_string('# TYPE vproxy_active_conns gauge\n')
+	sb.write_string('vproxy_active_conns{proto="http"} ${stdatomic.load_i64(&stats.active_conns)}\n')
+	sb.write_string('\n')
+	sb.write_string('# HELP vproxy_connections_total 累计连接数\n')
+	sb.write_string('# TYPE vproxy_connections_total counter\n')
+	sb.write_string('vproxy_connections_total{proto="http",status="ok"} ${stdatomic.load_i64(&stats.connections_ok_total)}\n')
+	sb.write_string('\n')
+	sb.write_string('# HELP vproxy_bytes_total 累计字节\n')
+	sb.write_string('# TYPE vproxy_bytes_total counter\n')
+	sb.write_string('vproxy_bytes_total{dir="in"} ${stdatomic.load_i64(&stats.bytes_in)}\n')
+	sb.write_string('vproxy_bytes_total{dir="out"} ${stdatomic.load_i64(&stats.bytes_out)}\n')
+	sb.write_string('\n')
+	sb.write_string('# HELP vproxy_errors_total 错误累计\n')
+	sb.write_string('# TYPE vproxy_errors_total counter\n')
+	sb.write_string('vproxy_errors_total{kind="auth_failed"} ${stdatomic.load_i64(&stats.errors_auth_failed_total)}\n')
+	sb.write_string('vproxy_errors_total{kind="upstream_connect"} ${stdatomic.load_i64(&stats.errors_upstream_connect_total)}\n')
+	sb.write_string('vproxy_errors_total{kind="idle_timeout"} ${stdatomic.load_i64(&stats.errors_idle_timeout_total)}\n')
+	return sb.str()
+}
+
+// 块作用：metrics HTTP 监听（最小实现，不引入 net.http.Server 的 worker pool）
+// 处理问题：独立于代理主监听的端口暴露 /metrics。绑定失败只告警不拖垮主进程；
+// accept 超时（1s）与主循环一致，配合 lifecycle.should_stop() 优雅退出。
+fn metrics_server(addr string, stats &Stats) {
+	mut server := net.listen_tcp(.ip, addr) or {
+		eprintln('Metrics: failed to listen on ${addr}: ${err}')
+		return
+	}
+	defer {
+		server.close() or {}
+	}
+	server.set_accept_timeout(1 * time.second)
+	eprintln('Metrics on ${addr} (Prometheus /metrics) ...')
+	for {
+		if lifecycle.should_stop() {
+			return
+		}
+		mut conn := server.accept() or { continue }
+		go handle_metrics_conn(mut conn, stats)
+	}
+}
+
+// 块作用：处理单个 /metrics 请求
+// 处理问题：只读一次请求头（上限 2KB），请求行以 GET /metrics 开头则返回文本，
+// 否则 404。给连接设读超时，防止恶意客户端挂死不释放 goroutine。
+fn handle_metrics_conn(mut conn net.TcpConn, stats &Stats) {
+	defer {
+		conn.close() or {}
+	}
+	conn.set_read_timeout(5 * time.second)
+	mut data := []u8{}
+	mut buf := []u8{len: 2048}
+	for data.len < 2048 {
+		n := conn.read(mut buf) or { break }
+		if n <= 0 {
+			break
+		}
+		data << buf[..n]
+		if find_header_end_from(data, 0) >= 0 {
+			break
+		}
+	}
+	if data.bytestr().starts_with('GET /metrics') {
+		body := render_metrics(stats)
+		conn.write_string('HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: ${body.len}\r\nConnection: close\r\n\r\n') or {
+			return
+		}
+		conn.write_string(body) or { return }
+		return
+	}
+	conn.write_string('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n') or {}
+}
+
 // 块作用：客户端连接处理
 // 处理问题：
 // 1. 读取并解析 HTTP 头部
@@ -133,7 +222,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	idle_dur time.Duration) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
+	// ok 标志：只有真正建立了上游连接并开始转发/隧道才算 "ok"。
+	// 鉴权失败 / 上游连接失败 / 畸形请求等非成功路径在 return 前置 false。
+	mut ok := true
 	defer {
+		if ok {
+			stdatomic.add_i64(&stats.connections_ok_total, 1)
+		}
 		stdatomic.add_i64(&stats.active_conns, -1)
 		stats.inflight.done()
 		socket.close() or {}
@@ -144,6 +239,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	}
 
 	header_bytes, mut pending_body := read_request_head(mut socket) or {
+		ok = false
 		send_simple_response(mut socket, '400 Bad Request', '${err}\n')
 		return
 	}
@@ -151,18 +247,21 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	header_str := header_bytes.bytestr()
 	first_line := header_str.all_before('\r\n')
 	if first_line == '' {
+		ok = false
 		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
 		return
 	}
 
 	first_parts := first_line.split(' ')
 	if first_parts.len < 3 {
+		ok = false
 		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
 		return
 	}
 
 	method := first_parts[0].to_upper()
 	if !valid_methods.contains(method) {
+		ok = false
 		send_simple_response(mut socket, '405 Method Not Allowed', 'Unsupported method\n')
 		return
 	}
@@ -210,11 +309,15 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 
 	if require_auth {
 		if !proxy_authorization.starts_with('Basic ') {
+			ok = false
+			stdatomic.add_i64(&stats.errors_auth_failed_total, 1)
 			send_proxy_auth_required(mut socket)
 			return
 		}
 		provided_cred := proxy_authorization[6..].trim_space().replace('\n', '').replace('\r', '')
 		if provided_cred != expected_auth {
+			ok = false
+			stdatomic.add_i64(&stats.errors_auth_failed_total, 1)
 			send_proxy_auth_required(mut socket)
 			return
 		}
@@ -227,6 +330,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	if method == 'CONNECT' {
 		upstream_host = normalize_authority(target, default_https_port)
 		if upstream_host == '' {
+			ok = false
 			send_simple_response(mut socket, '400 Bad Request', 'Missing CONNECT target\n')
 			return
 		}
@@ -236,6 +340,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			upstream_host = host_header
 		}
 		if upstream_host == '' {
+			ok = false
 			send_simple_response(mut socket, '400 Bad Request', 'Missing ws/wss target\n')
 			return
 		}
@@ -252,6 +357,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			upstream_host = host_header
 		}
 		if upstream_host == '' {
+			ok = false
 			send_simple_response(mut socket, '400 Bad Request', 'Missing Host header\n')
 			return
 		}
@@ -260,6 +366,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	}
 
 	mut upstream := net.dial_tcp(upstream_host) or {
+		ok = false
+		stdatomic.add_i64(&stats.errors_upstream_connect_total, 1)
 		eprintln('Failed to connect to ${upstream_host}: ${err}')
 		send_simple_response(mut socket, '502 Bad Gateway', 'Upstream connection failed: ${err}\n')
 		return
@@ -270,6 +378,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 
 	if method == 'CONNECT' {
 		socket.write_string(connection_established) or {
+			ok = false
 			eprintln('Failed to send CONNECT response: ${err}')
 			return
 		}
@@ -306,14 +415,17 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		ws_headers << ''
 		request_blob := ws_headers.join('\r\n') + '\r\n'
 		upstream.write_string(request_blob) or {
+			ok = false
 			eprintln('Failed to forward WebSocket upgrade: ${err}')
 			return
 		}
 		if pending_body.len > 0 {
 			upstream.write(pending_body) or {
+				ok = false
 				eprintln('Failed to forward pending body: ${err}')
 				return
 			}
+			stdatomic.add_i64(&stats.bytes_in, pending_body.len)
 		}
 
 		// 读上游 handshake response 直到 \r\n\r\n，复用 find_header_end_from
@@ -322,15 +434,18 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		mut header_end := -1
 		for header_end < 0 {
 			nn := upstream.read(mut read_buf) or {
+				ok = false
 				eprintln('Failed to read upstream WebSocket response: ${err}')
 				return
 			}
 			if nn <= 0 {
+				ok = false
 				eprintln('WebSocket upstream closed before handshake response')
 				return
 			}
 			resp_buf << read_buf[..nn]
 			if resp_buf.len > 65536 {
+				ok = false
 				eprintln('WebSocket upstream response too large')
 				return
 			}
@@ -343,6 +458,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 
 		// 透传整个 response 给客户端（headers + 任何已读的额外字节）
 		socket.write(resp_buf) or {
+			ok = false
 			eprintln('Failed to forward WebSocket response: ${err}')
 			return
 		}
@@ -357,11 +473,12 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			is_101 = status_parts[1] == '101'
 		}
 		if !is_101 {
+			ok = false
 			eprintln('WebSocket upstream returned non-101: ${status_line}')
 			return
 		}
 		eprintln('WebSocket: 101 handshake OK, entering relay')
-		relay_both_ways(mut socket, mut upstream)
+		relay_both_ways(mut socket, mut upstream, stats)
 		return
 	} else {
 		// 复用上面已 split 的 header_lines，避免对同一 header 重复 split
@@ -395,6 +512,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		forwarded_headers << ''
 		request_blob := forwarded_headers.join('\r\n') + '\r\n'
 		upstream.write_string(request_blob) or {
+			ok = false
 			eprintln('Failed to forward request: ${err}')
 			return
 		}
@@ -405,9 +523,11 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		// 剩余部分交给后续的双向 io.cp 透传。
 		if pending_body.len > 0 {
 			upstream.write(pending_body) or {
+				ok = false
 				eprintln('Failed to forward pending body: ${err}')
 				return
 			}
+			stdatomic.add_i64(&stats.bytes_in, pending_body.len)
 		}
 	}
 
@@ -415,38 +535,70 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	// 处理问题：通过协程实现全双工通信，支持 CONNECT 隧道及普通 HTTP 的流式响应（含 Chunked）
 	if method == 'HEAD' {
 		// HEAD 响应没有 body，仅单向复制响应头
-		io.cp(mut upstream, mut socket) or {}
+		copy_counted(mut upstream, mut socket, stats, 'out')
 	} else {
-		relay_both_ways(mut socket, mut upstream)
+		relay_both_ways(mut socket, mut upstream, stats)
 	}
 }
 
-// 块作用：双向 io.cp 中继（graceful teardown，单 owner close）
+// 块作用：双向中继（graceful teardown，单 owner close）+ 字节计数
 // 处理问题：修复并发双 close 竞态（Connection reset / EBADF）。
 // 旧实现的两个 relay goroutine 各自 defer close(src)+close(dst)，同一 fd 会被并发
 // close 2~3 次；先 close 释放的 fd 号被 accept 复用给新连接后，第二个 close 会把
 // 新连接误关，高并发下必现。现在每个方向只对写目标 dst 做 TCP 半关闭
 // （net.shutdown(handle, how: .write)，发 FIN 但不释放 fd），让对端读到 EOF 后自行
-// 关闭，从而让另一方向的 io.cp 及时返回；两个 fd 的完整 close 由 handle_client 的
+// 关闭，从而让另一方向的中继及时返回；两个 fd 的完整 close 由 handle_client 的
 // defer（socket）与 dial 后的 defer（upstream）各执行恰好一次，杜绝 fd 复用误关。
-fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn) {
+// 与旧实现 io.cp 的区别：copy_counted 额外按方向累计 bytes_in/bytes_out，
+// 不 close 任何 fd（半关闭与 close 语义与 io.cp 版本完全一致）。
+fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn, stats &Stats) {
 	mut wg := sync.new_waitgroup()
 	wg.add(2)
-	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+	go fn (mut src net.TcpConn, mut dst net.TcpConn, stats &Stats, mut wg sync.WaitGroup) {
 		defer {
 			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
-		io.cp(mut src, mut dst) or {}
-	}(mut a, mut b, mut wg)
-	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
+		copy_counted(mut src, mut dst, stats, 'in')
+	}(mut a, mut b, stats, mut wg)
+	go fn (mut src net.TcpConn, mut dst net.TcpConn, stats &Stats, mut wg sync.WaitGroup) {
 		defer {
 			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
-		io.cp(mut src, mut dst) or {}
-	}(mut b, mut a, mut wg)
+		copy_counted(mut src, mut dst, stats, 'out')
+	}(mut b, mut a, stats, mut wg)
 	wg.wait()
+}
+
+// 块作用：带字节计数与 idle_timeout 识别的单方向复制
+// 处理问题：替代 relay 热路径上的 io.cp：
+// 1. 每轮 read/write 后原子累加 bytes_in/bytes_out（纯内存操作，零额外 syscall）。
+// 2. 仅 'in' 方向（客户端 → 上游）的 read 超时计入 errors_idle_timeout_total：
+//    relay_both_ways 的两个方向同时空闲时，客户端侧与上游侧 read 都会超时，
+//    只有客户端侧计数，避免同一空闲事件被两个方向各计一次（双计）。
+//    write 失败（含超时）不计数，由读侧错误路径覆盖。
+// 3. 不在本函数内 close 任何 fd：fd 的完整关闭仍由 handle_client 的 defer 各执行
+//    恰好一次，保持与 io.cp 版本一致的半关闭/单 owner close 约定。
+fn copy_counted(mut src net.TcpConn, mut dst net.TcpConn, stats &Stats, dir string) {
+	mut buf := []u8{len: 64 * 1024}
+	for {
+		n := src.read(mut buf) or {
+			if dir == 'in' && err.code() == net.err_timed_out_code {
+				stdatomic.add_i64(&stats.errors_idle_timeout_total, 1)
+			}
+			return
+		}
+		if n <= 0 {
+			return
+		}
+		dst.write(buf[..n]) or { return }
+		if dir == 'in' {
+			stdatomic.add_i64(&stats.bytes_in, n)
+		} else {
+			stdatomic.add_i64(&stats.bytes_out, n)
+		}
+	}
 }
 
 // 块作用：目标解析

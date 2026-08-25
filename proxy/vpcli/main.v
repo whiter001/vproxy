@@ -31,6 +31,7 @@ pub const version = '0.2.0'
 pub struct HttpConfig {
 pub mut:
 	listen_addr  string
+	metrics_addr string // Prometheus /metrics 监听地址（默认 127.0.0.1:9090）
 	auth_user    string
 	auth_pass    string
 	auth_basic   string
@@ -93,6 +94,10 @@ pub fn parse_http_args(args []string) !HttpConfig {
 	listen := fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or {
 		''
 	}
+	metrics_addr := fp.string_opt('metrics-addr', 0,
+		'metrics listen address (Prometheus /metrics)', flag.FlagConfig{
+		val_desc: 'addr'
+	}) or { '' }
 	user := fp.string_opt('user', `u`, 'username', flag.FlagConfig{ val_desc: 'name' }) or { '' }
 	pass := fp.string_opt('pass', `p`, 'password', flag.FlagConfig{ val_desc: 'pwd' }) or { '' }
 	basic := fp.string_opt('auth-basic', `b`, 'pre-encoded Basic credential (base64(user:pass))', flag.FlagConfig{
@@ -120,6 +125,8 @@ pub fn parse_http_args(args []string) !HttpConfig {
 	// 三级优先级：CLI > env > default
 	final_listen := if listen != '' { listen } else { os.getenv_opt('PROXY_LISTEN_ADDR') or {
 			':5777'} }
+	final_metrics := if metrics_addr != '' { metrics_addr } else { os.getenv_opt('PROXY_METRICS_ADDR') or {
+			'127.0.0.1:9090'} }
 	final_user := if user != '' { user } else { os.getenv_opt('PROXY_AUTH_USER') or { '' } }
 	final_pass := if pass != '' { pass } else { os.getenv_opt('PROXY_AUTH_PASS') or { '' } }
 	final_basic := if basic != '' { basic } else { os.getenv_opt('PROXY_AUTH_BASIC') or { '' } }
@@ -133,6 +140,7 @@ pub fn parse_http_args(args []string) !HttpConfig {
 
 	return HttpConfig{
 		listen_addr:  final_listen
+		metrics_addr: final_metrics
 		auth_user:    final_user
 		auth_pass:    final_pass
 		auth_basic:   final_basic
@@ -302,6 +310,9 @@ pub fn print_http_help() {
 	fp.version(version)
 	fp.description('V-language HTTP forward proxy (CONNECT + Basic auth)')
 	fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or { '' }
+	fp.string_opt('metrics-addr', 0, 'metrics listen address (Prometheus /metrics)', flag.FlagConfig{
+		val_desc: 'addr'
+	}) or { '' }
 	fp.string_opt('user', `u`, 'username', flag.FlagConfig{ val_desc: 'name' }) or { '' }
 	fp.string_opt('pass', `p`, 'password', flag.FlagConfig{ val_desc: 'pwd' }) or { '' }
 	fp.string_opt('auth-basic', `b`, 'pre-encoded Basic credential (base64(user:pass))', flag.FlagConfig{

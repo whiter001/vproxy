@@ -126,11 +126,12 @@ jobs:
         with:
           check-latest: true
 
-      # WebSocket 协议 + SOCKS4 + lifecycle + CLI 解析 + mproxy 全套（全部本地，无外网依赖）
+      # WebSocket 协议 + SOCKS4 + lifecycle + CLI 解析 + metrics + mproxy 全套（全部本地，无外网依赖）
       - name: Run integration tests (no network)
         shell: bash
         run: |
           bash proxy/http/1/test_websocket.sh
+          bash proxy/http/1/test_metrics.sh
           bash proxy/socks4/1/test_protocol.sh
           bash proxy/lifecycle/test_lifecycle.sh
           bash proxy/vpcli/test_cli.sh

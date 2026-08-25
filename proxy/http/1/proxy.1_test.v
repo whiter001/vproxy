@@ -1,6 +1,7 @@
 module main
 
 import encoding.base64
+import sync.stdatomic
 
 // split_target：绝对 URL / 相对路径 / 裸 authority / wss 保端口。
 fn test_split_target() {
@@ -79,4 +80,40 @@ fn test_find_header_end_from() {
 	assert find_header_end_from('no header terminator'.bytes(), 0) == -1
 	// 长度不足 4 直接 -1
 	assert find_header_end_from([]u8{len: 3}, 0) == -1
+}
+
+// render_metrics：Prometheus 文本格式 + 原子计数读取。
+fn test_render_metrics() {
+	stats := &Stats{}
+	stdatomic.store_i64(&stats.active_conns, 12)
+	stdatomic.store_i64(&stats.connections_ok_total, 12345)
+	stdatomic.store_i64(&stats.errors_auth_failed_total, 3)
+	stdatomic.store_i64(&stats.errors_upstream_connect_total, 0)
+	stdatomic.store_i64(&stats.errors_idle_timeout_total, 1)
+	stdatomic.store_i64(&stats.bytes_in, 67890)
+	stdatomic.store_i64(&stats.bytes_out, 67890)
+
+	out := render_metrics(stats)
+
+	// HELP / TYPE 行齐全
+	assert out.contains('# HELP vproxy_active_conns 当前活跃连接数')
+	assert out.contains('# TYPE vproxy_active_conns gauge')
+	assert out.contains('# HELP vproxy_connections_total 累计连接数')
+	assert out.contains('# TYPE vproxy_connections_total counter')
+	assert out.contains('# HELP vproxy_bytes_total 累计字节')
+	assert out.contains('# TYPE vproxy_bytes_total counter')
+	assert out.contains('# HELP vproxy_errors_total 错误累计')
+	assert out.contains('# TYPE vproxy_errors_total counter')
+
+	// proto 固定 http；采样行值来自原子计数
+	assert out.contains('vproxy_active_conns{proto="http"} 12')
+	assert out.contains('vproxy_connections_total{proto="http",status="ok"} 12345')
+	assert out.contains('vproxy_bytes_total{dir="in"} 67890')
+	assert out.contains('vproxy_bytes_total{dir="out"} 67890')
+	assert out.contains('vproxy_errors_total{kind="auth_failed"} 3')
+	assert out.contains('vproxy_errors_total{kind="upstream_connect"} 0')
+	assert out.contains('vproxy_errors_total{kind="idle_timeout"} 1')
+
+	// 输出以换行结尾（Prometheus 文本格式要求）
+	assert out.ends_with('\n')
 }

@@ -7,6 +7,7 @@
 - **WebSocket 代理**（HTTP/1.1 `Upgrade: websocket` 握手 + 帧透传，RFC 6455）
 - `Proxy-Authorization: Basic ...` 鉴权（默认必填，可关闭）
 - 优雅退出（SIGINT/SIGTERM）+ 慢客户端 idle timeout（issue #5）
+- **Prometheus `/metrics`**（`--metrics-addr`，默认 `127.0.0.1:9090`）：活跃连接数 / 累计连接数 / 转发字节 / 错误计数
 - 命令行参数（issue #4）：`-l/-u/-p/-b/-n/-c/-f/--log-level/-h/-v`
 
 ## ⚠️ 安全提示
@@ -30,6 +31,7 @@ v run proxy/http/1/proxy.1.v
 Usage: vproxy http serve [options]
 
   -l, --listen addr         监听地址（覆盖 PROXY_LISTEN_ADDR）
+      --metrics-addr addr    Prometheus /metrics 监听地址（覆盖 PROXY_METRICS_ADDR，默认 127.0.0.1:9090）
   -u, --user name           用户名（覆盖 PROXY_AUTH_USER）
   -p, --pass pwd            密码（覆盖 PROXY_AUTH_PASS）
   -b, --auth-basic b64      预编码的 Basic 凭据（覆盖 PROXY_AUTH_BASIC）
@@ -55,6 +57,7 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PROXY_LISTEN_ADDR` | `:5777` | 监听地址 |
+| `PROXY_METRICS_ADDR` | `127.0.0.1:9090` | Prometheus `/metrics` 监听地址 |
 | `PROXY_REQUIRE_AUTH` | `1` | 设为 `0` 关闭鉴权（对齐 SOCKS5 的 `SOCKS5_NO_AUTH`） |
 | `PROXY_AUTH_USER` | _无_ | 代理用户名；**未设置时进程 fail-fast** |
 | `PROXY_AUTH_PASS` | _无_ | 代理密码；**未设置时进程 fail-fast** |
@@ -74,6 +77,54 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 退出码约定：
 - `0`：正常退出（SIGTERM 后 drain 完成）
 - `1`：配置错误（缺凭据等，参见 issue #1）
+
+## Metrics（Prometheus）
+
+代理默认在 `127.0.0.1:9090` 提供独立的 `/metrics` 端点（与代理主监听互不影响），
+可用于容量规划、报警与 SLO。绑定失败只打一条告警日志，不会拖垮代理主进程。
+
+```bash
+PROXY_AUTH_USER=alice PROXY_AUTH_PASS=secret \
+  v run proxy/http/1/proxy.1.v --metrics-addr 127.0.0.1:9090
+curl 127.0.0.1:9090/metrics
+```
+
+输出为 Prometheus 文本格式（`text/plain; version=0.0.4`）：
+
+```
+# HELP vproxy_active_conns 当前活跃连接数
+# TYPE vproxy_active_conns gauge
+vproxy_active_conns{proto="http"} 12
+
+# HELP vproxy_connections_total 累计连接数
+# TYPE vproxy_connections_total counter
+vproxy_connections_total{proto="http",status="ok"} 12345
+
+# HELP vproxy_bytes_total 累计字节
+# TYPE vproxy_bytes_total counter
+vproxy_bytes_total{dir="in"} 67890
+vproxy_bytes_total{dir="out"} 67890
+
+# HELP vproxy_errors_total 错误累计
+# TYPE vproxy_errors_total counter
+vproxy_errors_total{kind="auth_failed"} 3
+vproxy_errors_total{kind="upstream_connect"} 0
+vproxy_errors_total{kind="idle_timeout"} 0
+```
+
+| Metric | 类型 | 含义 |
+| --- | --- | --- |
+| `vproxy_active_conns{proto="http"}` | gauge | 当前活跃连接数（accept 时 +1，连接关闭时 -1） |
+| `vproxy_connections_total{proto="http",status="ok"}` | counter | 累计成功建立上游转发/隧道的连接数（鉴权通过且 dial 成功） |
+| `vproxy_bytes_total{dir="in"}` | counter | 累计客户端 → 上游转发字节 |
+| `vproxy_bytes_total{dir="out"}` | counter | 累计上游 → 客户端转发字节 |
+| `vproxy_errors_total{kind="auth_failed"}` | counter | 鉴权失败累计（407） |
+| `vproxy_errors_total{kind="upstream_connect"}` | counter | 上游连接失败累计（502） |
+| `vproxy_errors_total{kind="idle_timeout"}` | counter | idle timeout 累计（读超时） |
+
+**活跃连接数与 `ss -tn` 对账**：`vproxy_active_conns` 统计的是代理 accept 的客户端连接数。
+持有一条未关闭的连接时，`curl 127.0.0.1:9090/metrics` 中该值为 `1`，同时
+`ss -tn state established | grep :<proxy_port>` 应恰好显示 1 条 ESTAB 连接。
 
 ## 连接中继（relay teardown）
 
@@ -114,6 +165,7 @@ curl --fail --silent --show-error \
 
 ```bash
 bash proxy/http/1/test_full.sh         # 本地 upstreams：鉴权 / 头部 / Chunked / CONNECT
+bash proxy/http/1/test_metrics.sh     # /metrics 端点 + 累计 counters（feat(metrics)）
 bash proxy/http/1/test_fail_fast.sh    # 未设凭据 fail-fast（issue #1）
 bash proxy/http/1/test_websocket.sh    # WebSocket 握手 / 帧透传 / 非 101 透传
 bash proxy/lifecycle/test_lifecycle.sh # 优雅退出 / SO_REUSEADDR / idle timeout（issue #5）
