@@ -214,22 +214,22 @@ fn handle_client(mut socket net.TcpConn, remote string, stats &Stats, idle_dur t
 	}
 	lifecycle.apply_idle_timeout(mut upstream, idle_dur)
 
+	// 双向 xor_pipe 中继（半关闭传播）
+	// 半关闭语义：本方向 EOF/错误 → 向 dst 发 FIN，让对端感知 EOF，另一方向继续中继；
+	// 两个 socket 由 handle_client 外层 defer 在 wg.wait() 后各关一次，
+	// 避免双关（fd 复用误杀新连接）及 close 与对端 goroutine 阻塞 recv 竞争。
 	wg := sync.new_waitgroup()
 	wg.add(2)
-	// 客户端 → 远端：编码（client 写出方向）
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		xor_pipe(mut src, mut dst) or {}
 	}(mut socket, mut upstream, wg)
-	// 远端 → 客户端：解码（远端 server 端把响应编码过来，client 端需解码还原）
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		xor_pipe(mut src, mut dst) or {}

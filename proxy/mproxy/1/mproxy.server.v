@@ -355,23 +355,22 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, upstream_cfg socks5_dial.
 		}
 	}
 
+	// 双向 xor_pipe 中继（半关闭传播）
+	// 半关闭语义：本方向 EOF/错误 → 向 dst 发 FIN，让对端感知 EOF，另一方向继续中继；
+	// 两个 socket 由 handle_client 外层 defer 在 wg.wait() 后各关一次，
+	// 避免双关（fd 复用误杀新连接）及 close 与对端 goroutine 阻塞 recv 竞争。
 	wg := sync.new_waitgroup()
 	wg.add(2)
-	// upstream → client：响应按字节 XOR ^ 1 编码后再发
-	//（upstream 返回的是 raw 数据；server 编码后 client 解码还原）
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		xor_pipe(mut src, mut dst) or {}
 	}(mut upstream, mut socket, wg)
-	// client → upstream：client 发来的是已编码字节，server 端 XOR ^ 1 解码后 raw 转发给 upstream
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, wg &sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		xor_pipe(mut src, mut dst) or {}

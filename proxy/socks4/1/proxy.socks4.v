@@ -138,20 +138,22 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, ski
 
 	send_reply(mut socket, socks4_cd_granted, request.port, request.dst_ip_bytes)
 
+	// 双向 io.cp 中继（半关闭传播）
+	// 半关闭语义：本方向 EOF/错误 → 向 dst 发 FIN，让对端感知 EOF，另一方向继续中继；
+	// 两个 socket 由 handle_client 外层 defer 在 wg.wait() 后各关一次，
+	// 避免双关（fd 复用误杀新连接）及 close 与对端 goroutine 阻塞 recv 竞争。
 	mut wg := sync.new_waitgroup()
 	wg.add(2)
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		io.cp(mut src, mut dst) or {}
 	}(mut socket, mut upstream, mut wg)
 	go fn (mut src net.TcpConn, mut dst net.TcpConn, mut wg sync.WaitGroup) {
 		defer {
-			src.close() or {}
-			dst.close() or {}
+			net.shutdown(dst.sock.handle, how: .write)
 			wg.done()
 		}
 		io.cp(mut src, mut dst) or {}

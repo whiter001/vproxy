@@ -4,10 +4,11 @@
 
 set -u
 
-failed=0
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+cd "$script_dir"
 
 PROXY_BINARY="./proxy.1"
-V_SOURCE="proxy.1.v"
+V_SOURCE="./proxy.1.v"
 PORT=5777
 HTTP_UPSTREAM_PORT=18080
 CONNECT_UPSTREAM_PORT=18081
@@ -17,6 +18,7 @@ WORK_DIR="$(mktemp -d)"
 UPSTREAM_LOG="$WORK_DIR/upstream.log"
 UPSTREAM_PID=""
 PROXY_PID=""
+failed=0
 
 export PROXY_AUTH_USER="$USER"
 export PROXY_AUTH_PASS="$PASS"
@@ -395,6 +397,73 @@ if [[ $? -eq 0 ]]; then
     echo "✅ 畸形请求被拒"
 else
     echo "❌ 畸形请求未返回 400"
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 7: 半关闭传播（half-close）---"
+# 验证：客户端发送数据后对自己 socket 做 shutdown(SHUT_WR)，仍能收到完整回显。
+# 旧代码每个 goroutine defer 同时 close(src) 和 close(dst)，任一方向 EOF 时
+# 立即双向关闭，导致 echo 被截断或连接被 RST。
+# 正确语义：半关闭传播 FIN 给对端，另一方向继续中继数据直至完成。
+PORT="$PORT" CONNECT_UPSTREAM_PORT="$CONNECT_UPSTREAM_PORT" USER="$USER" PASS="$PASS" python3 - <<'PY'
+import base64
+import os
+import socket
+import time
+
+proxy_host = "127.0.0.1"
+proxy_port = int(os.environ["PORT"])
+target_host = "127.0.0.1"
+target_port = int(os.environ["CONNECT_UPSTREAM_PORT"])
+user = os.environ["USER"]
+password = os.environ["PASS"]
+credential = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+
+# CONNECT 建立隧道
+sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
+request = (
+    f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+    f"Host: {target_host}:{target_port}\r\n"
+    f"Proxy-Authorization: Basic {credential}\r\n"
+    "\r\n"
+)
+sock.sendall(request.encode("utf-8"))
+response = b""
+while b"\r\n\r\n" not in response:
+    chunk = sock.recv(4096)
+    if not chunk:
+        raise SystemExit("proxy closed before CONNECT completed")
+    response += chunk
+if b"200 Connection Established" not in response:
+    raise SystemExit(response.decode("utf-8", "replace"))
+
+# 发送 1024 字节，然后半关闭写端，再读取回显
+payload = b"halfclose_echo_test_payload_" + b"X" * 1000
+sock.sendall(payload)
+
+# 半关闭：只关闭写端，读端仍开放，proxy 另一方向的中继应继续工作
+sock.shutdown(socket.SHUT_WR)
+
+# 读取完整回显（echo server 会把收到的全部原样发回）
+received = b""
+sock.settimeout(5)
+while len(received) < len(payload):
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    received += chunk
+
+if received == payload:
+    print(f"  half-close: 发送 {len(payload)} 字节，半关闭后收到完整回显 {len(received)} 字节")
+else:
+    raise SystemExit(f"half-close 失败：发送 {len(payload)} 字节，收到 {len(received)} 字节，内容 {'匹配' if received == payload else '不匹配'}")
+sock.close()
+PY
+if [[ $? -eq 0 ]]; then
+    echo "✅ 半关闭传播正常"
+else
+    echo "❌ 半关闭传播有 bug"
     failed=$((failed + 1))
 fi
 
