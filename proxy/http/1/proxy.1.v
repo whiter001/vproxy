@@ -11,7 +11,9 @@ import time
 import vpcli
 
 const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
-const connection_established = 'HTTP/1.1 200 Connection Established\r\n\r\n'
+// RFC 7230 §5.7.1 / §6.2：代理应在响应中声明自己（Via / Proxy-Agent），
+// 与普通 HTTP 转发路径注入的头部保持一致。
+const connection_established = 'HTTP/1.1 200 Connection Established\r\nVia: 1.1 v-proxy\r\nProxy-Agent: V-Proxy/1.0\r\n\r\n'
 const default_http_port = ':80'
 const default_https_port = ':443'
 
@@ -140,13 +142,15 @@ fn proxy_auth_config(auth_basic string, user string, pass string, require_auth b
 	return base64.encode_str('${user}:${pass}'), true
 }
 
-// 块作用：客户端连接处理
+// 块作用：客户端连接处理（keep-alive 请求循环）
 // 处理问题：
 // 1. 读取并解析 HTTP 头部
 // 2. 校验 Proxy Basic Auth（认证，issue #1：require_auth=false 时跳过）
 // 3. 处理 CONNECT 隧道（HTTPS/TCP 代理）
 // 4. 处理普通 HTTP 转发及相关头部修改
 // 5. issue #5：应用 idle timeout；defer 通知 inflight WaitGroup 让优雅退出能 drain
+// 6. keep-alive：复用客户端 socket，循环处理同一连接上的多个请求，直到
+//    idle timeout / 客户端关闭 / 错误响应（Connection: close）。
 fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool,
 	idle_dur time.Duration) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
@@ -161,28 +165,56 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
-	header_bytes, mut pending_body := read_request_head(mut socket) or {
-		send_simple_response(mut socket, '400 Bad Request', '${err}\n')
-		return
+	// keep-alive 循环：process_request 返回 true 表示连接可复用。
+	// 注意：首请求前读到空连接（EOF）会返回 400；已处理过请求后再 EOF 属正常关闭，静默结束。
+	mut first_request := true
+	// 上一轮 read_request_head 多读的字节（可能含流水线/背靠背的下一请求、或 CL body
+	// 超出部分），作为下一轮读取的初始缓冲，避免被静默丢弃。
+	mut carry_body := []u8{}
+	for {
+		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur,
+			first_request, mut carry_body) or { break }
+		first_request = false
+		if !keep_alive {
+			break
+		}
+	}
+}
+
+// 块作用：处理单个 HTTP 请求（keep-alive 循环的一次迭代）
+// 处理问题：
+// 1. 读取并解析请求头、鉴权、目标解析
+// 2. 按方法分发：CONNECT 隧道 / WebSocket 透传 / 普通 HTTP 转发
+// 3. 上游连接按请求新建、请求结束即关闭（对上游强制 Connection: close，
+//    响应体靠 EOF 定界，避免完整解析 Content-Length/chunked）。
+// 返回 true 表示客户端连接可复用；false 或 error 表示连接关闭。
+// error 仅在读取失败 / 上游关闭时返回，不发送响应；首请求解析失败会先发 400。
+fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bool,
+	idle_dur time.Duration, first_request bool, mut carry_body []u8) !bool {
+	header_bytes, mut pending_body := read_request_head(mut socket, carry_body) or {
+		if first_request {
+			send_simple_response(mut socket, '400 Bad Request', '${err}\n')
+		}
+		return err
 	}
 
 	header_str := header_bytes.bytestr()
 	first_line := header_str.all_before('\r\n')
 	if first_line == '' {
 		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-		return
+		return error('close')
 	}
 
 	first_parts := first_line.split(' ')
 	if first_parts.len < 3 {
 		send_simple_response(mut socket, '400 Bad Request', 'Bad request\n')
-		return
+		return error('close')
 	}
 
 	method := first_parts[0].to_upper()
 	if !valid_methods.contains(method) {
 		send_simple_response(mut socket, '405 Method Not Allowed', 'Unsupported method\n')
-		return
+		return error('close')
 	}
 
 	target := first_parts[1]
@@ -193,6 +225,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	mut host_header := ''
 	mut upgrade_value := ''
 	mut connection_value := ''
+	mut content_length := 0
+	mut transfer_encoding := ''
 
 	for line in header_lines {
 		if line == '' {
@@ -206,6 +240,10 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			upgrade_value = line.all_after(':').trim_space().to_lower()
 		} else if starts_with_ci(line, 'connection:') {
 			connection_value = line.all_after(':').trim_space().to_lower()
+		} else if starts_with_ci(line, 'content-length:') {
+			content_length = line.all_after(':').trim_space().int()
+		} else if starts_with_ci(line, 'transfer-encoding:') {
+			transfer_encoding = line.all_after(':').trim_space().to_lower()
 		}
 	}
 
@@ -229,13 +267,20 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	if require_auth {
 		if !proxy_authorization.starts_with('Basic ') {
 			send_proxy_auth_required(mut socket)
-			return
+			return error('close')
 		}
 		provided_cred := proxy_authorization[6..].trim_space().replace('\n', '').replace('\r', '')
 		if provided_cred != expected_auth {
 			send_proxy_auth_required(mut socket)
-			return
+			return error('close')
 		}
+	}
+
+	// keep-alive 决策（RFC 7230 §6.3）：HTTP/1.1 默认持久连接，Connection: close 覆盖；
+	// HTTP/1.0 需显式 keep-alive token。CONNECT / WebSocket 恒为一次性，不走循环。
+	mut keep_alive := connection_keep_alive(version, connection_value)
+	if method == 'CONNECT' || is_websocket {
+		keep_alive = false
 	}
 
 	mut upstream_host := ''
@@ -246,7 +291,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		upstream_host = normalize_authority(target, default_https_port)
 		if upstream_host == '' {
 			send_simple_response(mut socket, '400 Bad Request', 'Missing CONNECT target\n')
-			return
+			return error('close')
 		}
 	} else if is_websocket {
 		upstream_host, request_path = split_target(target)
@@ -255,7 +300,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		}
 		if upstream_host == '' {
 			send_simple_response(mut socket, '400 Bad Request', 'Missing ws/wss target\n')
-			return
+			return error('close')
 		}
 		// ws:// → :80, wss:// → :443（split_target 已剥掉 scheme）
 		mut ws_default := default_http_port
@@ -271,7 +316,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		}
 		if upstream_host == '' {
 			send_simple_response(mut socket, '400 Bad Request', 'Missing Host header\n')
-			return
+			return error('close')
 		}
 		upstream_host = normalize_authority(upstream_host, default_http_port)
 		forwarded_first_line = '${method} ${request_path} ${version}'
@@ -280,17 +325,23 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	mut upstream := net.dial_tcp(upstream_host) or {
 		eprintln('Failed to connect to ${upstream_host}: ${err}')
 		send_simple_response(mut socket, '502 Bad Gateway', 'Upstream connection failed: ${err}\n')
-		return
+		return error('close')
 	}
 	defer {
 		upstream.close() or {}
 	}
+	// 上游连接不跨请求复用，并设 read timeout：避免上游不尊重 Connection: close 时
+	// io.cp 永久阻塞在 read 上（缓解「上游延迟关闭」风险）。
+	lifecycle.apply_idle_timeout(mut upstream, idle_dur)
 
 	if method == 'CONNECT' {
 		socket.write_string(connection_established) or {
 			eprintln('Failed to send CONNECT response: ${err}')
-			return
+			return error('close')
 		}
+		eprintln('CONNECT: tunnel established to ${upstream_host}')
+		relay_both_ways(mut socket, mut upstream)
+		return false
 	} else if is_websocket {
 		// 块作用：WebSocket 握手 + 透传
 		// 处理问题（RFC 6455）：
@@ -325,12 +376,12 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		request_blob := ws_headers.join('\r\n') + '\r\n'
 		upstream.write_string(request_blob) or {
 			eprintln('Failed to forward WebSocket upgrade: ${err}')
-			return
+			return false
 		}
 		if pending_body.len > 0 {
 			upstream.write(pending_body) or {
 				eprintln('Failed to forward pending body: ${err}')
-				return
+				return false
 			}
 		}
 
@@ -341,16 +392,16 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		for header_end < 0 {
 			nn := upstream.read(mut read_buf) or {
 				eprintln('Failed to read upstream WebSocket response: ${err}')
-				return
+				return false
 			}
 			if nn <= 0 {
 				eprintln('WebSocket upstream closed before handshake response')
-				return
+				return false
 			}
 			resp_buf << read_buf[..nn]
 			if resp_buf.len > 65536 {
 				eprintln('WebSocket upstream response too large')
-				return
+				return false
 			}
 			header_end = find_header_end_from(resp_buf, if resp_buf.len > nn + 3 {
 				resp_buf.len - nn - 3
@@ -362,7 +413,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		// 透传整个 response 给客户端（headers + 任何已读的额外字节）
 		socket.write(resp_buf) or {
 			eprintln('Failed to forward WebSocket response: ${err}')
-			return
+			return false
 		}
 
 		// 校验状态码：必须是 101 Switching Protocols
@@ -376,12 +427,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		}
 		if !is_101 {
 			eprintln('WebSocket upstream returned non-101: ${status_line}')
-			return
+			return false
 		}
 		eprintln('WebSocket: 101 handshake OK, entering relay')
 		relay_both_ways(mut socket, mut upstream)
-		return
+		return false
 	} else {
+		// 块作用：普通 HTTP 转发
 		// 复用上面已 split 的 header_lines，避免对同一 header 重复 split
 		mut forwarded_headers := []string{}
 		forwarded_headers << forwarded_first_line
@@ -394,10 +446,16 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 			if line == '' {
 				continue // 忽略空行
 			}
-			// 移除代理相关的头部，防止循环代理或泄露验证信息
+			// 移除代理相关的头部，防止循环代理或泄露验证信息；
+			// 同时剥离 Connection / Proxy-Connection（由代理统一管理 keep-alive 语义）
 			if starts_with_ci(line, 'proxy-authorization:')
 				|| starts_with_ci(line, 'authorization:')
-				|| starts_with_ci(line, 'proxy-connection:') {
+				|| starts_with_ci(line, 'proxy-connection:') || starts_with_ci(line, 'connection:') {
+				continue
+			}
+			if method == 'HEAD' && (starts_with_ci(line, 'content-length:')
+				|| starts_with_ci(line, 'transfer-encoding:')) {
+				// HEAD 无请求体（RFC 7231 §4.3.2）：剥掉 CL/TE，避免上游等待不存在的 body
 				continue
 			}
 			if starts_with_ci(line, 'host:') {
@@ -410,32 +468,115 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		}
 		forwarded_headers << 'Via: 1.1 v-proxy'
 		forwarded_headers << 'Proxy-Agent: V-Proxy/1.0'
+		// 强制上游 Connection: close：响应体靠 EOF 定界，且上游连接不跨请求复用
+		forwarded_headers << 'Connection: close'
 		forwarded_headers << ''
 		request_blob := forwarded_headers.join('\r\n') + '\r\n'
 		upstream.write_string(request_blob) or {
 			eprintln('Failed to forward request: ${err}')
-			return
+			return error('close')
 		}
 
-		// --- 优化：流式转发 Body ---
-		// 不再区分 Content-Length 或 Chunked，
-		// 直接将之前读取 header 时多读到的 body 部分发送给上游，
-		// 剩余部分交给后续的双向 io.cp 透传。
-		if pending_body.len > 0 {
-			upstream.write(pending_body) or {
-				eprintln('Failed to forward pending body: ${err}')
-				return
+		has_chunked_body := transfer_encoding.contains('chunked')
+		if has_chunked_body {
+			// chunked 请求体：退化为双向 relay 透传（不做 chunked 帧解析），
+			// 请求结束后连接不复用（relay 会向客户端发 FIN，语义上连接已结束）。
+			// 上游已强制 Connection: close，响应仍能靠 EOF 定界，test_full.sh 测试 3 保持通过。
+			if pending_body.len > 0 {
+				upstream.write(pending_body) or {
+					eprintln('Failed to forward pending body: ${err}')
+					return error('close')
+				}
+			}
+			relay_both_ways(mut socket, mut upstream)
+			return false
+		}
+
+		// Content-Length 请求体：流式转发恰好 CL 字节，保证请求边界清晰
+		// （keep-alive 下不能靠 relay 双向透传，否则无法知道请求体何时结束）。
+		// HEAD 无请求体语义（RFC 7231 §4.3.2）：一律跳过 body 转发，不读客户端 → 上游。
+		if method != 'HEAD' && content_length > 0 {
+			mut body_forwarded := 0
+			if pending_body.len > 0 {
+				send_len := if pending_body.len > content_length {
+					content_length
+				} else {
+					pending_body.len
+				}
+				upstream.write(pending_body[..send_len]) or {
+					eprintln('Failed to forward body: ${err}')
+					return error('close')
+				}
+				body_forwarded = send_len
+				// 超出 CL 的字节可能是下一请求，回灌给下一轮请求解析
+				pending_body = pending_body[send_len..].clone()
+			}
+			mut body_buf := []u8{len: 16384}
+			for body_forwarded < content_length {
+				remaining := content_length - body_forwarded
+				read_len := if remaining < body_buf.len { remaining } else { body_buf.len }
+				// 只读剩余 CL 字节：避免把提前到达的下一请求误当作 body 写入上游
+				// （拆包 + 多请求同段的场景下读多会破坏上游连接帧边界）。
+				n := socket.read(mut body_buf[..read_len]) or {
+					eprintln('Failed to read request body: ${err}')
+					return error('close')
+				}
+				if n <= 0 {
+					eprintln('Client closed while sending request body')
+					return error('close')
+				}
+				upstream.write(body_buf[..n]) or {
+					eprintln('Failed to forward request body: ${err}')
+					return error('close')
+				}
+				body_forwarded += n
 			}
 		}
-	}
 
-	// 块作用：建立双向数据通道
-	// 处理问题：通过协程实现全双工通信，支持 CONNECT 隧道及普通 HTTP 的流式响应（含 Chunked）
-	if method == 'HEAD' {
-		// HEAD 响应没有 body，仅单向复制响应头
+		// 读上游响应头（复用 read_request_head 的读取逻辑，直到 \r\n\r\n）
+		resp_head, resp_pending := read_response_head(mut upstream) or {
+			eprintln('Upstream closed before response: ${err}')
+			return error('close')
+		}
+		resp_lines := resp_head.bytestr().split('\r\n')
+
+		// 若响应既无 Content-Length 也无 Transfer-Encoding（close-delimited），
+		// 客户端只能靠连接 EOF 判断响应结束，因此本连接不可复用。
+		if method != 'HEAD' && !response_has_body_length(resp_lines) {
+			keep_alive = false
+		}
+
+		// 改写响应头：剥离上游的 Connection / Proxy-Connection（上游被强制 close），
+		// 按本连接是否复用补 Connection: keep-alive / close。
+		rewritten := rewrite_response_connection(resp_lines, keep_alive)
+		socket.write_string(rewritten.join('\r\n') + '\r\n') or {
+			eprintln('Failed to forward response head: ${err}')
+			return error('close')
+		}
+		if resp_pending.len > 0 {
+			socket.write(resp_pending) or {
+				eprintln('Failed to forward response body: ${err}')
+				return error('close')
+			}
+		}
+
+		// 把本轮回灌缓冲写回：pending_body 中未被消费的字节（流水线下一请求、或 CL body
+		// 超出部分）作为下一轮 read_request_head 的初始缓冲，避免被静默丢弃。
+		carry_body = pending_body.clone()
+
+		if method == 'HEAD' {
+			// HEAD 独立路径：仅单向转发响应头，不读客户端 → 上游，也不复制 body。
+			// HEAD 响应无 body（RFC 7231 §4.3.2），defer 关闭上游即完成；
+			// 客户端侧连接按 keep_alive 决策继续复用。
+			return keep_alive
+		}
+
+		// 普通响应体：单向 io.cp(upstream → socket) 直到上游 EOF
+		// （对上游强制了 Connection: close，EOF 即响应结束）。
+		// 注意：与 relay_both_ways 不同，此处**不能**对客户端 shutdown(WRITE)——
+		// 发 FIN 会告诉客户端连接结束，keep-alive 复用失效。
 		io.cp(mut upstream, mut socket) or {}
-	} else {
-		relay_both_ways(mut socket, mut upstream)
+		return keep_alive
 	}
 }
 
@@ -447,6 +588,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 // （net.shutdown(handle, how: .write)，发 FIN 但不释放 fd），让对端读到 EOF 后自行
 // 关闭，从而让另一方向的 io.cp 及时返回；两个 fd 的完整 close 由 handle_client 的
 // defer（socket）与 dial 后的 defer（upstream）各执行恰好一次，杜绝 fd 复用误关。
+// 仅用于一次性路径：CONNECT 隧道、WebSocket 101 透传、chunked 请求体退化透传。
 fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn) {
 	mut wg := sync.new_waitgroup()
 	wg.add(2)
@@ -535,6 +677,68 @@ fn starts_with_ci(line string, prefix string) bool {
 	return true
 }
 
+// 块作用：判定客户端连接是否可复用（keep-alive）
+// 处理问题（RFC 7230 §6.3）：HTTP/1.1 默认持久连接，Connection: close 显式关闭；
+// HTTP/1.0 需显式 keep-alive token；close 与 keep-alive 并存时 close 优先。
+// CONNECT / WebSocket 由调用方另行强制为一次性。
+fn connection_keep_alive(version string, connection_value string) bool {
+	mut has_close := false
+	mut has_keep_alive := false
+	for token in connection_value.split(',') {
+		t := token.trim_space()
+		if t == 'close' {
+			has_close = true
+		} else if t == 'keep-alive' {
+			has_keep_alive = true
+		}
+	}
+	if has_close {
+		return false
+	}
+	if version == 'HTTP/1.1' {
+		return true
+	}
+	return has_keep_alive
+}
+
+// 块作用：改写上游响应头的 Connection 字段
+// 处理问题：对上游强制了 Connection: close，响应头必然带 Connection: close；
+// 若原样透传，keep-alive 客户端看到后不会复用连接（验收项「同连接连续 5 次 GET」必挂）。
+// 剥离上游的 Connection / Proxy-Connection，按本连接是否复用补对应的 token。
+// head 为 split('\r\n') 后的响应头行列表；返回列表以 '' 结尾，
+// 调用方 join('\r\n') + '\r\n' 后即得到完整的 "\r\n\r\n" 终止。
+fn rewrite_response_connection(head []string, keep_alive bool) []string {
+	mut out := []string{}
+	for line in head {
+		if line == '' {
+			continue // 跳过空行（含尾部终止空行，末尾统一补）
+		}
+		if starts_with_ci(line, 'connection:') || starts_with_ci(line, 'proxy-connection:') {
+			continue
+		}
+		out << line
+	}
+	if keep_alive {
+		out << 'Connection: keep-alive'
+	} else {
+		out << 'Connection: close'
+	}
+	out << '' // 终止空行占位
+	return out
+}
+
+// 块作用：判断响应头是否声明了响应体长度（Content-Length 或 Transfer-Encoding）
+// 处理问题：close-delimited 响应（两者皆无）只能靠连接 EOF 定界，
+// keep-alive 下客户端无法判断响应结束，必须改为关闭连接。
+fn response_has_body_length(head []string) bool {
+	for line in head {
+		if starts_with_ci(line, 'content-length:') || starts_with_ci(line, 'transfer-encoding:') {
+			return true
+		}
+	}
+	return false
+}
+
 fn send_simple_response(mut socket net.TcpConn, status_line string, message string) {
 	body := message
 	response := 'HTTP/1.1 ${status_line}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.len}\r\n\r\n${body}'
@@ -550,11 +754,14 @@ fn send_proxy_auth_required(mut socket net.TcpConn) {
 }
 
 // 块作用：读取头部原始字节
-// 处理问题：持续读取直至发现 \r\n\r\n 标志，限制头部最大长度 64KB
-fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
-	mut data := []u8{}
+// 处理问题：持续读取直至发现 \r\n\r\n 标志，限制头部最大长度 64KB。
+// initial 为上一轮 keep-alive 多读的字节（流水线/背靠背的下一请求、或 CL body 超出部分），
+// 先在其中寻找完整请求头，避免已读入的下一请求被丢弃导致循环永久阻塞。
+fn read_request_head(mut socket net.TcpConn, initial []u8) !([]u8, []u8) {
+	mut data := initial.clone()
 	mut buf := []u8{len: 8192}
-	for {
+	mut header_end := find_header_end_from(data, 0)
+	for header_end < 0 {
 		n := socket.read(mut buf) or { return err }
 		if n <= 0 {
 			return error('Bad request')
@@ -563,14 +770,15 @@ fn read_request_head(mut socket net.TcpConn) !([]u8, []u8) {
 		if data.len > 65536 {
 			return error('Request too large')
 		}
-		header_end := find_header_end_from(data,
-			if data.len > n + 3 { data.len - n - 3 } else { 0 })
-		if header_end >= 0 {
-			// 返回 (头部字节数组, 剩余已读取的 body 部分)
-			return data[..header_end], data[header_end + 4..]
-		}
+		header_end = find_header_end_from(data, if data.len > n + 3 { data.len - n - 3 } else { 0 })
 	}
-	return error('Bad request')
+	// 返回 (头部字节数组, 剩余已读取的 body 部分)
+	return data[..header_end], data[header_end + 4..]
+}
+
+// 块作用：读取上游响应头（复用 read_request_head 的读取逻辑，无初始缓冲）
+fn read_response_head(mut upstream net.TcpConn) !([]u8, []u8) {
+	return read_request_head(mut upstream, []u8{})
 }
 
 fn find_header_end_from(data []u8, start int) int {

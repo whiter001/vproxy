@@ -7,6 +7,8 @@
 - **WebSocket 代理**（HTTP/1.1 `Upgrade: websocket` 握手 + 帧透传，RFC 6455）
 - `Proxy-Authorization: Basic ...` 鉴权（默认必填，可关闭）
 - 优雅退出（SIGINT/SIGTERM）+ 慢客户端 idle timeout（issue #5）
+- **客户端连接 keep-alive**（同一 TCP 连接复用处理多个请求，RFC 7230 §6.3）
+- `CONNECT` 200 响应携带 `Via` / `Proxy-Agent`（RFC 7230 §5.7.1 / §6.2）
 - 命令行参数（issue #4）：`-l/-u/-p/-b/-n/-c/-f/--log-level/-h/-v`
 
 ## ⚠️ 安全提示
@@ -77,12 +79,31 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 
 ## 连接中继（relay teardown）
 
-双向数据通道（CONNECT 隧道、WebSocket、普通 HTTP 流式响应）由两个 `io.cp` goroutine 中继。
-任一方向 EOF 时，该方向只对写目标做 TCP 半关闭（`net.shutdown(how: .write)`，发 FIN 不释放
-fd），让对端读到 EOF 后自行关闭；另一方向继续中继直至完成。两个 fd 由 `handle_client` 的
-defer 在 `wg.wait()` 后各关闭恰好一次——避免旧实现「两个 goroutine 并发 close 同一 fd」
-导致的 fd 复用误关新连接（高并发 Connection reset / EBADF），也避免 close 与对端 goroutine
-阻塞 recv 竞争。对应测试：`test_full.sh` 测试 7（半关闭传播）。
+双向数据通道（CONNECT 隧道、WebSocket 101 透传、chunked 请求体退化透传）由两个 `io.cp`
+goroutine 中继。任一方向 EOF 时，该方向只对写目标做 TCP 半关闭（`net.shutdown(how: .write)`，
+发 FIN 不释放 fd），让对端读到 EOF 后自行关闭；另一方向继续中继直至完成。两个 fd 由
+`handle_client` 的 defer 在 `wg.wait()` 后各关闭恰好一次——避免旧实现「两个 goroutine 并发
+close 同一 fd」导致的 fd 复用误关新连接（高并发 Connection reset / EBADF），也避免 close 与
+对端 goroutine 阻塞 recv 竞争。对应测试：`test_full.sh` 测试 7（半关闭传播）。
+
+普通 HTTP 的响应体不经过双向中继：对上游强制 `Connection: close` 后单向 `io.cp`
+（上游 → 客户端）直到上游 EOF 即响应结束，且**不**对客户端发送 FIN，客户端连接可继续复用。
+
+## keep-alive（客户端连接复用）
+
+- 客户端侧：`handle_client` 循环调用 `process_request` 处理同一连接上的多个请求，直到
+  idle timeout、客户端关闭或错误响应（`400/405/407/502`，均带 `Connection: close`）。
+- HTTP/1.1 默认持久连接，`Connection: close` 显式关闭；HTTP/1.0 需显式 `keep-alive`。
+- 上游侧：每个请求独立新建连接并在请求结束时关闭（转发时强制 `Connection: close`），
+  响应体靠上游 EOF 定界，无需解析 Content-Length / chunked。
+- 响应头会剥离上游的 `Connection: close`，按客户端连接是否复用改写为
+  `Connection: keep-alive` / `close`，否则 curl 等客户端看到 `close` 后不会复用连接。
+- `CONNECT` 与 WebSocket 恒为一次性，不走 keep-alive 循环。
+- 客户端侧支持背靠背/流水线请求：`read_request_head` 多读的字节（下一请求、或
+  Content-Length body 超出部分）会作为下一轮读取的初始缓冲，不会被丢弃；请求体读取按
+  声明的 Content-Length 精确截断，不会把提前到达的下一请求误写上游。
+- 已知限制：close-delimited 请求体（有 body 但既无 Content-Length 也无
+  Transfer-Encoding，HTTP/1.1 下无效）不转发；上游响应体靠 EOF 定界。
 
 ## 示例
 
@@ -116,6 +137,7 @@ curl --fail --silent --show-error \
 bash proxy/http/1/test_full.sh         # 本地 upstreams：鉴权 / 头部 / Chunked / CONNECT
 bash proxy/http/1/test_fail_fast.sh    # 未设凭据 fail-fast（issue #1）
 bash proxy/http/1/test_websocket.sh    # WebSocket 握手 / 帧透传 / 非 101 透传
+bash proxy/http/1/test_keepalive.sh    # keep-alive 复用 / CONNECT Via / HEAD 独立路径
 bash proxy/lifecycle/test_lifecycle.sh # 优雅退出 / SO_REUSEADDR / idle timeout（issue #5）
 bash proxy/vpcli/test_cli.sh           # CLI 参数解析（issue #4）
 ```

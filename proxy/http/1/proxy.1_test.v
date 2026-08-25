@@ -80,3 +80,61 @@ fn test_find_header_end_from() {
 	// 长度不足 4 直接 -1
 	assert find_header_end_from([]u8{len: 3}, 0) == -1
 }
+
+// connection_keep_alive：HTTP/1.1 默认持久；Connection: close 覆盖；
+// HTTP/1.0 需显式 keep-alive；close 与 keep-alive 并存时 close 优先。
+fn test_connection_keep_alive() {
+	// HTTP/1.1 无 Connection 头 → 默认持久
+	assert connection_keep_alive('HTTP/1.1', '') == true
+	// HTTP/1.1 显式 keep-alive → 持久
+	assert connection_keep_alive('HTTP/1.1', 'keep-alive') == true
+	// HTTP/1.1 显式 close → 不持久
+	assert connection_keep_alive('HTTP/1.1', 'close') == false
+	// 逗号分隔列表：close 覆盖 keep-alive（RFC 7230 §6.3）
+	assert connection_keep_alive('HTTP/1.1', 'keep-alive, close') == false
+	// HTTP/1.0 无 keep-alive token → 不持久
+	assert connection_keep_alive('HTTP/1.0', '') == false
+	// HTTP/1.0 显式 keep-alive → 持久
+	assert connection_keep_alive('HTTP/1.0', 'keep-alive') == true
+	// 调用处已 to_lower：这里直接验证小写 token 的列表解析
+	assert connection_keep_alive('HTTP/1.1', 'upgrade, keep-alive') == true
+}
+
+// rewrite_response_connection：剥离上游 Connection / Proxy-Connection，
+// 按 keep_alive 补 Connection: keep-alive / close，并保证以 '' 结尾（终止空行占位）。
+fn test_rewrite_response_connection() {
+	// 剥离上游 Connection: close，补 keep-alive
+	lines := ['HTTP/1.1 200 OK', 'Content-Type: text/plain', 'Connection: close', '']
+	rewritten := rewrite_response_connection(lines, true)
+	assert rewritten == ['HTTP/1.1 200 OK', 'Content-Type: text/plain', 'Connection: keep-alive',
+		'']
+
+	// 不复用时补 Connection: close
+	rewritten2 := rewrite_response_connection(lines, false)
+	assert rewritten2 == ['HTTP/1.1 200 OK', 'Content-Type: text/plain', 'Connection: close', '']
+
+	// 上游无 Connection 头时也正常补全
+	lines2 := ['HTTP/1.1 200 OK', '']
+	rewritten3 := rewrite_response_connection(lines2, true)
+	assert rewritten3 == ['HTTP/1.1 200 OK', 'Connection: keep-alive', '']
+
+	// Proxy-Connection 同样剥离
+	lines3 := ['HTTP/1.1 200 OK', 'Proxy-Connection: keep-alive', '']
+	rewritten4 := rewrite_response_connection(lines3, true)
+	assert rewritten4 == ['HTTP/1.1 200 OK', 'Connection: keep-alive', '']
+
+	// 头以裸状态行结尾（无尾部 \r\n）时也以 '' 收尾，保证 join 后为完整 \r\n\r\n
+	lines4 := ['HTTP/1.1 200 OK']
+	rewritten5 := rewrite_response_connection(lines4, true)
+	assert rewritten5 == ['HTTP/1.1 200 OK', 'Connection: keep-alive', '']
+	assert rewritten5.join('\r\n') + '\r\n' == 'HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n'
+}
+
+// response_has_body_length：有 Content-Length 或 Transfer-Encoding 才认为响应体可定界。
+fn test_response_has_body_length() {
+	assert response_has_body_length(['HTTP/1.1 200 OK', 'Content-Length: 5', '']) == true
+	assert response_has_body_length(['HTTP/1.1 200 OK', 'Transfer-Encoding: chunked', '']) == true
+	assert response_has_body_length(['HTTP/1.1 200 OK', 'Connection: close', '']) == false
+	// 大小写不敏感
+	assert response_has_body_length(['HTTP/1.1 200 OK', 'content-length: 5', '']) == true
+}
