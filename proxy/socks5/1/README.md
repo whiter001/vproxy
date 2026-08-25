@@ -84,3 +84,10 @@ curl --socks5-user user:pwd --socks5 127.0.0.1:5778 https://httpbin.org/ip
 | SIGINT / SIGTERM 优雅退出 | accept 1s 超时轮询 `lifecycle.should_stop()`；drain in-flight 连接后退出码 0 |
 | 慢客户端 idle timeout | `SOCKS5_IDLE_TIMEOUT` 环境变量（默认 300s），客户端 + upstream 都生效 |
 | SO_REUSEADDR / TCP_NODELAY | V 标准库默认开启 |
+
+## 连接中继（relay teardown）
+
+CONNECT 成功后的双向数据通道由两个 `io.cp` goroutine 中继。任一方向 EOF 时只对写目标做
+TCP 半关闭（`net.shutdown(how: .write)` 发 FIN，不释放 fd），让对端读到 EOF 后自行关闭；
+另一方向继续中继直至完成。两个 fd 由 `handle_client` 的 defer 在 `wg.wait()` 后各关闭
+恰好一次，避免并发双 close 导致的 fd 复用误关新连接（高并发 Connection reset / EBADF）。

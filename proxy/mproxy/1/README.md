@@ -20,12 +20,19 @@ V 语言重新实现的 [whiter001/mproxy](https://gitee.com/whiter001/mproxy)�
 | 维度 | C 版 mproxy | 本仓库 V 版 |
 | --- | --- | --- |
 | 语言 | C | V |
-| 双向中继 | `fork()` + 双进程 | `io.cp` 两 goroutine |
+| 双向中继 | `fork()` + 双进程 | `io.cp` / `xor_pipe` 两 goroutine（半关闭传播 teardown） |
 | "加密" | `buffer[i] ^= 1` | 同左（**不是真加密**） |
 | 鉴权 | 无 | 可选 `MPROXY_REQUIRE_AUTH` |
 | 上游 | 直接 dial | 直接 dial 或 `-u` SOCKS5 链式转发 |
 | 生命周期 | 无 | SIGINT/SIGTERM drain + idle timeout（复用 `proxy/lifecycle/`） |
 | 测试 | 无 | bash + Python ThreadedTCPServer，10+ 测试场景 |
+
+## 连接中继（relay teardown）
+
+`serve` 模式用 `io.cp`、`client`/`server` 用 `xor_pipe` 做双向中继。任一方向 EOF 时只对写
+目标做 TCP 半关闭（`net.shutdown(how: .write)` 发 FIN，不释放 fd），让对端读到 EOF 后自行
+关闭；另一方向继续中继直至完成。两个 fd 由连接级 defer 在 `wg.wait()` 后各关闭恰好一次，
+避免并发双 close 导致的 fd 复用误关新连接（高并发 Connection reset / EBADF）。
 
 ## 运行
 

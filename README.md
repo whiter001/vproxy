@@ -38,6 +38,7 @@ bash scripts/stress_test.sh
 # 可选参数：STRESS_REQUESTS=2000 STRESS_CONCURRENCY=100
 ```
 
-> 注意：当前 V 版代理的 io.cp 双向中继 teardown 存在并发缺陷（双 close 竞争导致 fd 复用被误关），
-> 高并发（≥2 并发）下会出现 Connection reset / EBADF，压测会如实失败并输出代理日志；
-> 修复该 teardown 后压测即可通过。详见提交报告。
+> 中继 teardown：所有代理（http / mproxy / socks4 / socks5）的双向中继采用**半关闭传播**
+> （half-close）——任一方向 EOF 时仅对写目标发 FIN（`net.shutdown(how: .write)`），另一方向
+> 继续中继直至完成；两个 socket 由连接级 defer 在 WaitGroup 结束后各关闭恰好一次，避免并发
+> 双 close 导致的 fd 复用误关（Connection reset / EBADF）。压测（`scripts/stress_test.sh`）通过。

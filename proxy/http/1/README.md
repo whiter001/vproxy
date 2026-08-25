@@ -75,6 +75,15 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 - `0`：正常退出（SIGTERM 后 drain 完成）
 - `1`：配置错误（缺凭据等，参见 issue #1）
 
+## 连接中继（relay teardown）
+
+双向数据通道（CONNECT 隧道、WebSocket、普通 HTTP 流式响应）由两个 `io.cp` goroutine 中继。
+任一方向 EOF 时，该方向只对写目标做 TCP 半关闭（`net.shutdown(how: .write)`，发 FIN 不释放
+fd），让对端读到 EOF 后自行关闭；另一方向继续中继直至完成。两个 fd 由 `handle_client` 的
+defer 在 `wg.wait()` 后各关闭恰好一次——避免旧实现「两个 goroutine 并发 close 同一 fd」
+导致的 fd 复用误关新连接（高并发 Connection reset / EBADF），也避免 close 与对端 goroutine
+阻塞 recv 竞争。对应测试：`test_full.sh` 测试 7（半关闭传播）。
+
 ## 示例
 
 ```bash
