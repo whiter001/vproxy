@@ -44,6 +44,22 @@ fn main() {
 	expected_user := cfg.auth_user
 	skip_auth := cfg.no_auth
 
+	if cfg.config_file != '' {
+		eprintln('Config loaded from ${cfg.config_file}')
+	}
+	// 打印生效配置（SOCKS4 无 password 字段，无需打码项）
+	vpcli.print_effective_config(vpcli.EffectiveConfig{
+		label:        'socks4'
+		listen_addr:  cfg.listen_addr
+		auth_user:    cfg.auth_user
+		log_level:    cfg.log_level
+		log_format:   cfg.log_format
+		metrics_addr: cfg.metrics_addr
+		idle_timeout: cfg.idle_timeout
+		allow_rules:  cfg.allow_rules
+		deny_rules:   cfg.deny_rules
+	})
+
 	lifecycle.install_signal_handlers()
 	idle_dur := cfg.idle_timeout
 

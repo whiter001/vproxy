@@ -43,7 +43,10 @@ fn dial_addr(target_host string, target_port u16, atyp u8) string {
 }
 
 fn main() {
-	cfg := vpcli.parse_socks5_args(os.args) or { C.exit(1) }
+	cfg := vpcli.parse_socks5_args(os.args) or {
+		eprintln('parse error: ${err}')
+		C.exit(1)
+	}
 	if cfg.show_help {
 		vpcli.print_socks5_help()
 		return
@@ -54,9 +57,28 @@ fn main() {
 	}
 
 	listen_addr := cfg.listen_addr
+	expected_user := cfg.auth_user
+	expected_pass := cfg.auth_pass
+
+	if cfg.config_file != '' {
+		eprintln('Config loaded from ${cfg.config_file}')
+	}
+	// 打印生效配置：auth.password 打码，避免敏感信息进启动日志
+	vpcli.print_effective_config(vpcli.EffectiveConfig{
+		label:        'socks5'
+		listen_addr:  cfg.listen_addr
+		auth_user:    cfg.auth_user
+		auth_pass:    cfg.auth_pass
+		log_level:    cfg.log_level
+		log_format:   cfg.log_format
+		metrics_addr: cfg.metrics_addr
+		idle_timeout: cfg.idle_timeout
+		allow_rules:  cfg.allow_rules
+		deny_rules:   cfg.deny_rules
+	})
 
 	lifecycle.install_signal_handlers()
-	idle_dur := lifecycle.idle_timeout_from_env('SOCKS5_IDLE_TIMEOUT')
+	idle_dur := cfg.idle_timeout
 
 	mut server := net.listen_tcp(.ip, listen_addr) or {
 		eprintln('Failed to listen on ${listen_addr}: ${err}')
@@ -89,7 +111,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, idle_dur)
+		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -100,7 +122,8 @@ fn main() {
 	eprintln('shutdown: complete')
 }
 
-fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration) {
+fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, expected_user string,
+	expected_pass string) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -113,14 +136,14 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration) {
 		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
-	if !handle_greeting_and_auth(mut socket) {
+	if !handle_greeting_and_auth(mut socket, expected_user, expected_pass) {
 		return
 	}
 
 	handle_request(mut socket, idle_dur)
 }
 
-fn handle_greeting_and_auth(mut socket net.TcpConn) bool {
+fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
 	mut greeting := []u8{len: 2}
 	n := socket.read(mut greeting) or {
 		eprintln('Failed to read greeting: ${err}')
@@ -150,21 +173,20 @@ fn handle_greeting_and_auth(mut socket net.TcpConn) bool {
 		read += r
 	}
 
-	auth_username := os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' }
-	auth_password := os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' }
+	auth_username := expected_user
+	auth_password := expected_pass
 	auth_required := auth_username != '' && auth_password != ''
 
 	if auth_required {
 		has_userpass := methods.contains(socks5_auth_userpass)
-		has_no_auth := methods.contains(socks5_auth_no_auth)
-		if !has_userpass && !has_no_auth {
-			socket.write([u8(5), socks5_auth_no_acceptable]) or {}
-			return false
-		}
 		if has_userpass {
 			socket.write([u8(5), socks5_auth_userpass]) or {}
 			return handle_userpass_auth(mut socket, auth_username, auth_password)
 		}
+		// 鉴权开启时，客户端未提供 userpass 方法（即使同时声明 0x00 no-auth）一律拒绝，
+		// 防止仅声明 no-auth 绕过凭据校验（security: auth bypass）。
+		socket.write([u8(5), socks5_auth_no_acceptable]) or {}
+		return false
 	}
 
 	if methods.contains(socks5_auth_no_auth) {

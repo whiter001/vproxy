@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# issue #4 回归测试：HTTP + SOCKS5 代理的 CLI 参数解析。
+# issue #4 回归测试：HTTP + SOCKS5 代理的 CLI 参数解析；issue #6 TOML 配置文件。
 #
 # 覆盖：
 #   1. --help / --version  退出码 0 + 输出
@@ -8,6 +8,10 @@
 #   4. 未识别选项          退出码 1
 #   5. 显式子命令 serve    与省略等价
 #   6. SOCKS5 同样行为
+#   7. --config TOML 加载 + 生效配置日志（密码打码）
+#   8. CLI > env > file > default 四级优先级
+#   9. 坏 TOML / 未知键 fail-fast（退出码非 0 + path:line）
+#  10. SOCKS5 文件 auth 接线（正确凭据放行 / 错误凭据拒绝）
 
 set -u
 
@@ -268,33 +272,36 @@ fi
 cleanup_pid "$pid"
 
 # ---------------------------------------------------------------------------
-echo "--- 测试 12: SOCKS5_NO_AUTH=1 绕过 SOCKS5_AUTH_USERNAME/PASSWORD ---"
-# 关键：即使设了 user/pass env，SOCKS5_NO_AUTH=1 应允许 no-auth 客户端
+echo "--- 测试 12: 配置 user/pass 时仅声明 no-auth 一律拒绝（安全修复） ---"
+# 关键：一旦配置了 user/pass（此处走 env），客户端只声明 0x00 no-auth 必须被
+# 0xff 拒绝，绝不回退到免认证放行（防鉴权绕过）。注意 SOCKS5_NO_AUTH=1 虽已
+# 解析进 cfg.no_auth，但运行时尚未消费（见 review 残留风险），故即使带上该
+# env，no-auth 客户端仍应被拒绝。
 SOCKS5_AUTH_USERNAME=env_u SOCKS5_AUTH_PASSWORD=env_p \
 SOCKS5_NO_AUTH=1 \
 "$socks5_bin" -l 127.0.0.1:9998 > /tmp/cli_s.log 2>&1 &
 pid=$!
 sleep 0.8
-# Python 客户端用 no-auth 应能进 greeting
+# Python 客户端用 no-auth 应被拒绝（0xff）
 python3 - <<PY
 import socket, sys
 try:
     s = socket.create_connection(('127.0.0.1', 9998), timeout=3)
     s.sendall(b'\x05\x01\x00')
     rep = s.recv(2)
-    if rep == b'\x05\x00':
-        print('NOAUTH_OK')
+    if rep == b'\x05\xff':
+        print('NOAUTH_REJECTED')
     else:
-        print(f'NOAUTH_FAIL: rep={rep!r}', file=sys.stderr)
+        print(f'NOAUTH_ACCEPTED: rep={rep!r}', file=sys.stderr)
         sys.exit(1)
 finally:
     s.close()
 PY
 noauth_rc=$?
 if [[ $noauth_rc -eq 0 ]]; then
-    echo "✅ SOCKS5_NO_AUTH=1 允许免认证（即便 env 设了 user/pass）"
+    echo "✅ 配置 user/pass 时 no-auth 客户端被 0xff 拒绝（安全修复）"
 else
-    echo "❌ SOCKS5_NO_AUTH=1 未生效"
+    echo "❌ no-auth 未被拒绝（鉴权绕过漏洞仍存在）"
     cat /tmp/cli_s.log
     failed=$((failed + 1))
 fi
@@ -456,8 +463,183 @@ fi
 cleanup_pid "$pid"
 
 # ---------------------------------------------------------------------------
+# issue #6：TOML 配置文件
+echo "--- 测试 19: HTTP --config 加载 TOML + 生效配置日志（密码打码） ---"
+cat > /tmp/proxy_cfg_test.toml <<'TOML'
+listen = "127.0.0.1:10091"
+auth = { user = "alice", password = "secret" }
+log = { level = "info", format = "text" }
+metrics_addr = "127.0.0.1:9090"
+idle_timeout_seconds = 300
+
+[rules]
+allow = ["*.example.com"]
+deny = ["evil.test"]
+TOML
+unset PROXY_LISTEN_ADDR PROXY_AUTH_USER PROXY_AUTH_PASS PROXY_AUTH_BASIC PROXY_REQUIRE_AUTH
+"$http_bin" --config /tmp/proxy_cfg_test.toml > /tmp/cli_h.log 2>&1 &
+pid=$!
+sleep 0.8
+ok=1
+grep -q 'Config loaded from /tmp/proxy_cfg_test.toml' /tmp/cli_h.log || ok=0
+grep -q -- '--- Effective config (http) ---' /tmp/cli_h.log || ok=0
+grep -q 'listen = 127.0.0.1:10091' /tmp/cli_h.log || ok=0
+grep -q 'auth.user = alice' /tmp/cli_h.log || ok=0
+grep -Fq 'auth.password = ******' /tmp/cli_h.log || ok=0
+grep -q 'metrics_addr = 127.0.0.1:9090' /tmp/cli_h.log || ok=0
+grep -q 'rules.allow' /tmp/cli_h.log || ok=0
+if [[ $ok -eq 1 ]]; then
+    echo "✅ --config 加载 + 生效配置日志 + 密码打码"
+else
+    echo "❌ --config 加载异常"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 20: 优先级 CLI > env > file ---"
+# file=10091, env=10092, CLI=10093
+PROXY_LISTEN_ADDR=127.0.0.1:10092 \
+PROXY_AUTH_USER=u PROXY_AUTH_PASS=p \
+"$http_bin" --config /tmp/proxy_cfg_test.toml > /tmp/cli_h.log 2>&1 &
+pid=$!
+sleep 0.8
+if grep -q 'Listen on 127.0.0.1:10092' /tmp/cli_h.log; then
+    echo "✅ env 覆盖 file（env > file）"
+else
+    echo "❌ env 未覆盖 file"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+PROXY_LISTEN_ADDR=127.0.0.1:10092 \
+PROXY_AUTH_USER=u PROXY_AUTH_PASS=p \
+"$http_bin" --config /tmp/proxy_cfg_test.toml -l 127.0.0.1:10093 > /tmp/cli_h.log 2>&1 &
+pid=$!
+sleep 0.8
+if grep -q 'Listen on 127.0.0.1:10093' /tmp/cli_h.log; then
+    echo "✅ CLI 覆盖 env（CLI > env > file）"
+else
+    echo "❌ CLI 未覆盖 env"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 21: 坏 TOML 语法 fail-fast（非零退出 + path:line） ---"
+printf 'listen = "1"\n[auth\nuser="x"\n' > /tmp/proxy_bad.toml
+unset PROXY_LISTEN_ADDR PROXY_AUTH_USER PROXY_AUTH_PASS PROXY_AUTH_BASIC
+"$http_bin" --config /tmp/proxy_bad.toml > /tmp/cli_h.log 2>&1
+rc=$?
+if [[ $rc -ne 0 ]] && grep -q '/tmp/proxy_bad.toml:2:' /tmp/cli_h.log; then
+    echo "✅ 坏 TOML 退出码 $rc 且报 path:line"
+else
+    echo "❌ 坏 TOML 未 fail-fast rc=$rc"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 22: 未知键 fail-fast（非零退出 + path:line） ---"
+printf 'listen = "127.0.0.1:10091"\nbogus_key = "x"\n' > /tmp/proxy_unknown.toml
+"$http_bin" --config /tmp/proxy_unknown.toml > /tmp/cli_h.log 2>&1
+rc=$?
+if [[ $rc -ne 0 ]] && grep -q '/tmp/proxy_unknown.toml:2:' /tmp/cli_h.log \
+    && grep -q 'unknown key "bogus_key"' /tmp/cli_h.log; then
+    echo "✅ 未知键退出码 $rc 且报 path:line + 键名"
+else
+    echo "❌ 未知键未 fail-fast rc=$rc"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 23: 类型错误 fail-fast（int 当 string） ---"
+printf 'listen = "127.0.0.1:10091"\nmetrics_addr = 123\n' > /tmp/proxy_type.toml
+"$http_bin" --config /tmp/proxy_type.toml > /tmp/cli_h.log 2>&1
+rc=$?
+if [[ $rc -ne 0 ]] && grep -q '/tmp/proxy_type.toml:2:' /tmp/cli_h.log \
+    && grep -q 'must be a string' /tmp/cli_h.log; then
+    echo "✅ 类型错误退出码 $rc 且报 path:line"
+else
+    echo "❌ 类型错误未 fail-fast rc=$rc"
+    cat /tmp/cli_h.log
+    failed=$((failed + 1))
+fi
+
+# ---------------------------------------------------------------------------
+echo "--- 测试 24: SOCKS5 文件 auth 接线（正确凭据放行 / 错误凭据拒绝） ---"
+cat > /tmp/proxy_socks5_cfg.toml <<'TOML'
+listen = "127.0.0.1:10094"
+auth = { user = "alice", password = "secret" }
+idle_timeout_seconds = 60
+TOML
+unset SOCKS5_AUTH_USERNAME SOCKS5_AUTH_PASSWORD SOCKS5_NO_AUTH
+"$socks5_bin" --config /tmp/proxy_socks5_cfg.toml > /tmp/cli_s.log 2>&1 &
+pid=$!
+for _ in {1..50}; do
+    if nc -z 127.0.0.1 10094 >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+if ! nc -z 127.0.0.1 10094 >/dev/null 2>&1; then
+    echo "❌ SOCKS5 未监听 10094"
+    cat /tmp/cli_s.log
+    failed=$((failed + 1))
+else
+    # 生效配置日志：password 打码 + idle_timeout 来自文件
+    if grep -Fq 'auth.password = ******' /tmp/cli_s.log \
+        && grep -q 'idle_timeout_seconds = 60' /tmp/cli_s.log; then
+        echo "✅ SOCKS5 生效配置日志（password 打码 + idle_timeout=60）"
+    else
+        echo "❌ SOCKS5 生效配置日志缺失"
+        cat /tmp/cli_s.log
+        failed=$((failed + 1))
+    fi
+    python3 - <<PY
+import socket, sys
+# 错误凭据应被拒绝（0x01）
+s = socket.create_connection(('127.0.0.1', 10094), timeout=3)
+s.sendall(b'\x05\x01\x02')
+rep = s.recv(2)
+if rep != b'\x05\x02':
+    print(f'expected userpass method, got {rep!r}', file=sys.stderr); sys.exit(1)
+s.sendall(b'\x01\x05alice\x06wrong!')
+rep = s.recv(2)
+if rep != b'\x01\x01':
+    print(f'expected auth failure 0x01, got {rep!r}', file=sys.stderr); sys.exit(1)
+s.close()
+# 正确凭据应放行（0x00），随后 connect 到 unreachable 端口应得 rep 5
+s = socket.create_connection(('127.0.0.1', 10094), timeout=3)
+s.sendall(b'\x05\x01\x02')
+rep = s.recv(2)
+s.sendall(b'\x01\x05alice\x06secret')
+rep = s.recv(2)
+if rep != b'\x01\x00':
+    print(f'expected auth ok 0x00, got {rep!r}', file=sys.stderr); sys.exit(1)
+s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x01')
+rep = s.recv(4)
+if len(rep) < 2 or rep[1] != 5:
+    print(f'expected reply 5 (conn refused), got {rep!r}', file=sys.stderr); sys.exit(1)
+s.close()
+print('SOCKS5_FILE_AUTH_OK')
+PY
+    if [[ $? -eq 0 ]]; then
+        echo "✅ SOCKS5 文件 auth 接线生效（错误拒绝 / 正确放行）"
+    else
+        echo "❌ SOCKS5 文件 auth 接线异常"
+        cat /tmp/cli_s.log
+        failed=$((failed + 1))
+    fi
+fi
+cleanup_pid "$pid"
+
+# ---------------------------------------------------------------------------
 echo "--- 清理 ---"
 rm -f "$http_bin" "$socks5_bin" "$socks4_bin" /tmp/cli_h.log /tmp/cli_s.log /tmp/cli_s4.log
+rm -f /tmp/proxy_cfg_test.toml /tmp/proxy_socks5_cfg.toml /tmp/proxy_bad.toml /tmp/proxy_unknown.toml /tmp/proxy_type.toml
 pkill -f h_check 2>/dev/null
 pkill -f s_check 2>/dev/null
 pkill -f s4_check 2>/dev/null
