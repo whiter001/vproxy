@@ -61,6 +61,20 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 | `PROXY_AUTH_BASIC` | _无_ | 直接提供 Base64 编码后的 `username:password`，优先级最高 |
 | `PROXY_IDLE_TIMEOUT` | `300` | 单连接最大空闲秒数（issue #5，`0` 禁用） |
 
+## Keep-alive 行为
+
+当前实现为**每 TCP 连接单请求**：`handle_client` 只读取一次请求头（`read_request_head`）、处理并中继，
+随后返回并关闭连接，**没有 keep-alive 循环**——不解析 `Connection: keep-alive`，也不复用连接处理后续请求。
+错误响应（`400/405/502`）与 `407` 均带 `Connection: close`。
+
+如需复用连接，请在客户端侧使用连接池；每请求一次握手与 TLS 成本无法在代理侧复用。
+
+## 最大 Header 大小
+
+请求头上限 **64KB（65536 字节）**：`read_request_head`（`proxy.1.v`）在累计读取超过
+65536 字节仍未见到 `\r\n\r\n` 时，返回 `400 Bad Request`（body 为 `Request too large`）。
+超大 Cookie、超长请求行的场景会触发该限制。
+
 ## 生命周期（issue #5）
 
 | 行为 | 实现 |
