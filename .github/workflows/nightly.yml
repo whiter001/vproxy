@@ -1,0 +1,61 @@
+name: Nightly
+
+# 每日 03:00 UTC 运行外网烟测（httpbin.org）与 -prod 性能基准（wrk）。
+# 外网依赖偶发抖动，不适合放 CI 主流程（push/PR 必须全本地、3 分钟内稳定通过），
+# 因此统一移到这里，失败不影响主流程。
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      # 外网烟测：httpbin.org 不可达时 REQUIRE_NET=1 硬失败（烟测语义）
+      - name: Real-network smoke test (httpbin.org)
+        shell: bash
+        run: |
+          REQUIRE_NET=1 bash scripts/test_real.sh
+
+  bench:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      - name: Install wrk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk
+
+      # v -prod 编译 + 本地 HTTP 上游 + wrk 打代理，收集吞吐/延迟
+      - name: Run wrk throughput benchmark (prod build)
+        shell: bash
+        run: |
+          bash scripts/bench_wrk.sh
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.txt

@@ -90,6 +90,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: format
+    timeout-minutes: 3
 
     steps:
       - name: Checkout
@@ -105,13 +106,18 @@ jobs:
         run: |
           v test proxy/http/1 proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle
 
-      # 真网 E2E（HTTP / SOCKS5 / SOCKS4 → httpbin.org），替换原内联 curl 用例，
-      # 覆盖更全（含无鉴权/错误凭据 → 407、SOCKS5 错误凭据拒绝）。
-      # REQUIRE_NET=1：httpbin 不可达时硬失败（对齐原内联用例的严格语义）。
-      - name: Run real-network tests (httpbin.org)
+      # 本地全量测试（无外网依赖）：
+      # - HTTP：鉴权 407 / 头部清理 / Chunked / CONNECT 隧道 / HEAD / 畸形请求 / half-close
+      # - SOCKS5：本地 TCP echo + CONNECT 隧道 + 鉴权成功/失败
+      - name: Run HTTP full test (local upstreams)
         shell: bash
         run: |
-          REQUIRE_NET=1 bash scripts/test_real.sh
+          bash proxy/http/1/test_full.sh
+
+      - name: Run SOCKS5 full test (local upstreams)
+        shell: bash
+        run: |
+          bash proxy/socks5/1/test_full.sh
 
   test-websocket:
     runs-on: ubuntu-latest
