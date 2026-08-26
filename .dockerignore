@@ -1,0 +1,9 @@
+# Docker 构建上下文排除：只把构建代理所需源码打进上下文，避免把 CI 产物/仓库元数据
+# 复制进 builder，加速构建并减小上下文。
+.git
+.agentflow
+.github
+bin
+scripts
+*.log
+.DS_Store

@@ -53,14 +53,19 @@ jobs:
           - target: windows-x86_64
             os: windows-latest
             bin_ext: .exe
+            # mingw/tcc 不接受 -cflags "-O3"，windows 目标省略优化 flag
+            optflags: ""
           - target: linux-x86_64
             os: ubuntu-latest
+            optflags: '-cflags "-O3"'
           - target: darwin-x86_64
             os: macos-latest
             vflags: -d cross_compile_macos_x86_64
+            optflags: '-cflags "-O3"'
           - target: darwin-arm64
             os: macos-latest
             vflags: -d cross_compile_macos_arm64
+            optflags: '-cflags "-O3"'
 
     runs-on: ${{ matrix.os }}
 
@@ -79,13 +84,199 @@ jobs:
           VFLAGS: ${{ matrix.vflags }}
         run: |
           mkdir -p ./bin
-          v -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${{ matrix.src }}
+          # -prod：消除 bounds check 并启用优化（默认 debug 构建）；$VFLAGS 使
+          # darwin 交叉编译 defines 真正生效；-cflags "-O3" 对齐 GCC/Clang 优化级别。
+          # 注意：未启用 -autofree —— V 0.5.2 V3 后端编译本项目会 SIGKILL（编译期 OOM），
+          # 见 PR 说明；两种方案产物均 < 1 MiB。
+          v $VFLAGS -prod ${{ matrix.optflags }} -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${{ matrix.src }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.proxy }}-${{ matrix.target }}
-          path: bin/*
+          # 只上传本次产物，绝不带出 bin/ 下被 git 跟踪的陈旧/错标二进制
+          # （git 中 bin/proxy.*.linux-x86_64 实为 Mach-O arm64），
+          # 否则 size-check / release 的 merge-multiple 合并后可能量到、发布错标文件。
+          path: ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }}
+
+  # 尺寸回归检查：硬门槛（HTTP Linux 二进制 < 1 MiB）+ PR 评论对比最新 release，
+  # 防止 -prod 优化被回退（如误改回 debug 构建）。
+  size-check:
+    runs-on: ubuntu-latest
+    needs: build
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./bin
+          merge-multiple: true
+
+      - name: Hard gate — HTTP Linux binary must stay < 1 MiB
+        shell: bash
+        run: |
+          # 纵深防御：除尺寸门槛外，确认量到的是真实 Linux ELF 产物
+          # （git 中历史跟踪的错标文件为 Mach-O arm64，即使上传/合并逻辑回归也不放行）。
+          if ! file ./bin/proxy.http.linux-x86_64 | grep -q 'ELF'; then
+            echo "::error::proxy.http.linux-x86_64 不是 ELF 二进制 —— 陈旧/错标文件混入产物"
+            exit 1
+          fi
+          SIZE=$(stat -c %s ./bin/proxy.http.linux-x86_64)
+          echo "proxy.http.linux-x86_64 = ${SIZE} bytes"
+          if [ "$SIZE" -ge 1048576 ]; then
+            echo "::error::proxy.http.linux-x86_64 is ${SIZE} bytes (>= 1 MiB) — -prod 优化疑似回退"
+            exit 1
+          fi
+
+      - name: Comment size report on PR
+        # 尺寸提示是「提示」性质，不应阻断 CI：
+        # 1) fork PR 的 GITHUB_TOKEN 固定只读（workflow 声明的提升权限会被忽略），
+        #    写 PR 评论必然 403，故 fork PR 直接跳过；
+        # 2) continue-on-error 兜底其它 token 无写权限的场景，保证评论失败不红 CI。
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = path.join(process.env.GITHUB_WORKSPACE, 'bin');
+            const files = fs.readdirSync(dir).filter(f => fs.statSync(path.join(dir, f)).isFile()).sort();
+            const sizes = {};
+            for (const f of files) sizes[f] = fs.statSync(path.join(dir, f)).size;
+
+            // 对比最新 release 同名资产尺寸，检测体积回退
+            let latest = {};
+            try {
+              const { data: releases } = await github.rest.repos.listReleases({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 1,
+              });
+              if (releases.length > 0) {
+                for (const a of releases[0].assets) latest[a.name] = a.size;
+              }
+            } catch (e) {
+              console.log('no prior release to compare:', e.message);
+            }
+
+            let rows = '';
+            for (const f of files) {
+              const cur = sizes[f];
+              const prev = latest[f];
+              let delta = '—';
+              if (prev !== undefined) {
+                const pct = prev === 0 ? 0 : ((cur - prev) / prev) * 100;
+                delta = pct > 1 ? `⚠️ **+${pct.toFixed(1)}%** (+${cur - prev} B)` : `${pct.toFixed(1)}%`;
+              }
+              rows += `| \`${f}\` | ${cur} | ${prev ?? '—'} | ${delta} |\n`;
+            }
+            const httpSize = sizes['proxy.http.linux-x86_64'];
+            const gate = httpSize !== undefined && httpSize < 1048576 ? '✅' : '❌';
+
+            const body =
+              `<!-- vproxy-size-check -->\n` +
+              `### 二进制尺寸对比（-prod 构建）\n\n` +
+              `| 产物 | 本次 (B) | 最新 release (B) | 变化 |\n|---|---|---|---|\n${rows}\n\n` +
+              `**HTTP 代理 Linux x86_64 < 1 MiB 门槛：${gate}**${httpSize !== undefined ? `（${httpSize} B）` : ''}\n`;
+
+            // upsert：复用上次的评论，避免重复刷屏
+            const marker = '<!-- vproxy-size-check -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const old = comments.find(c => c.body.includes(marker));
+            if (old) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: old.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  # 验收 3 的可复现证据：真实 Docker 构建 + 运行冒烟。
+  # 需求环境无 Docker（且沙箱屏蔽 docker.io），本地无法实测，故在 CI 上固化为冒烟 job：
+  # bake 构建 vproxy:latest → file/ldd 断言静态链接（scratch 无 glibc）→
+  # docker run -p 5777:5777 → curl -x 经代理访问 http://example.com 断言 200
+  # （代理在容器内解析 example.com，同时覆盖静态 glibc 读 /etc/resolv.conf 的 DNS 链路）。
+  # 若 Linux 实测静态 glibc DNS 异常（200 断言失败），按 Dockerfile 注释回退运行层为
+  # gcr.io/distroless/base。
+  docker-smoke:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image with bake
+        shell: bash
+        run: |
+          # setup-buildx-action 默认创建 docker-container driver，默认输出不进守护进程；
+          # 显式 output=type=docker 把 vproxy:latest 载入本地 daemon 供 docker run 使用。
+          docker buildx bake --set default.output=type=docker
+
+      - name: Assert static linking (scratch has no glibc)
+        shell: bash
+        run: |
+          id=$(docker create vproxy:latest)
+          docker cp "$id":/vproxy /tmp/vproxy
+          docker rm "$id" >/dev/null
+          file /tmp/vproxy
+          if ! file /tmp/vproxy | grep -q 'statically linked'; then
+            echo "::error::产物不是静态链接 —— scratch 运行层无 glibc，容器启动即 exec format 失败"
+            exit 1
+          fi
+          if ! ldd /tmp/vproxy 2>&1 | grep -q 'not a dynamic executable'; then
+            echo "::error::ldd 显示产物仍依赖动态库"
+            exit 1
+          fi
+
+      - name: Smoke test — docker run + proxied request
+        shell: bash
+        run: |
+          docker run --rm -d --name vproxy-smoke -p 5777:5777 vproxy:latest
+          trap 'docker rm -f vproxy-smoke >/dev/null 2>&1' EXIT
+          # 容器内无 shell，无法 docker exec 探测监听状态；用请求探测就绪
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -sS -m 2 -x http://127.0.0.1:5777 http://example.com/ -o /dev/null 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::代理 30s 内未就绪（Docker 冒烟失败）"
+            docker logs vproxy-smoke 2>&1 | tail -20 || true
+            exit 1
+          fi
+          code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -x http://127.0.0.1:5777 http://example.com/)
+          echo "curl -x via container proxy: HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::Docker 冒烟断言失败：期望 200，实得 $code（静态 glibc DNS 异常需按 Dockerfile 注释回退 distroless/base）"
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-latest
@@ -156,6 +347,13 @@ jobs:
           git tag "v${{ github.run_number }}"
           git push origin "v${{ github.run_number }}"
 
+      - name: Clean stale tracked binaries
+        shell: bash
+        run: |
+          # git 中历史跟踪的陈旧/错标二进制不应进入校验和。必须在下载前清理：
+          # 本次产物文件名均为 proxy.*，下载后再执行 rm 会误删全部刚下载的二进制。
+          rm -f ./bin/proxy.*
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -170,7 +368,8 @@ jobs:
         shell: bash
         run: |
           cd ./bin
-          find . -type f -exec sha256sum {} \; > SHA256SUMS
+          # 排除 SHA256SUMS 自身：shell 重定向会先创建（空）文件，find 命中它会产生自引用哈希
+          find . -type f ! -name SHA256SUMS -exec sha256sum {} \; > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create Release
