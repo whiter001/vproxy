@@ -45,3 +45,15 @@ fn test_is_all_digits_and_dots() {
 	assert is_all_digits_and_dots('1.2.3.4a') == false
 	assert is_all_digits_and_dots('1.2.3') == true // 粗判只看字符集
 }
+
+fn test_ipv4_octet_validation() {
+	assert (parse_ipv4_octet('0') or { 99 }) == 0
+	assert (parse_ipv4_octet('192') or { 99 }) == 192
+	assert (parse_ipv4_octet('255') or { 99 }) == 255
+	if _ := parse_ipv4_octet('256') {
+		assert false
+	}
+	if _ := parse_ipv4_octet('') {
+		assert false
+	}
+}

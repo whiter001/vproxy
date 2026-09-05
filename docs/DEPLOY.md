@@ -138,32 +138,8 @@ nssm start vproxy-http
 
 ## Docker
 
-```bash
-docker run -d --name vproxy --restart unless-stopped -p 5777:5777 \
-  -e PROXY_LISTEN_ADDR=0.0.0.0:5777 \
-  -e PROXY_AUTH_USER=foo \
-  -e PROXY_AUTH_PASS=bar \
-  ghcr.io/whiter001/vproxy:latest
-```
-
-Docker Compose：
-
-```yaml
-services:
-  vproxy:
-    image: ghcr.io/whiter001/vproxy:latest
-    container_name: vproxy
-    restart: unless-stopped
-    ports:
-      - "5777:5777"
-    environment:
-      PROXY_LISTEN_ADDR: "0.0.0.0:5777"
-      PROXY_AUTH_USER: "foo"
-      PROXY_AUTH_PASS: "bar"
-```
-
-> 仓库当前不含 Dockerfile；`ghcr.io/whiter001/vproxy:latest` 由发布流程构建推送。
-> 如需自建镜像：基于 debian/alpine 拷贝对应平台二进制，入口设为该二进制即可。
+仓库当前不含 Dockerfile，也没有容器镜像发布 job。请使用 CI 生成的对应平台二进制自行制作镜像，
+并将入口设置为该二进制；不要直接依赖未由本仓库发布流程生成的 GHCR 镜像。
 
 ## 加固建议
 

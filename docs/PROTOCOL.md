@@ -15,12 +15,12 @@
 | Proxy Basic 认证（RFC 7617） | ✅ | `Proxy-Authorization: Basic ...`，默认必填；未通过返回 `407` |
 | 流式 Body | ✅ | `Content-Length` / `Chunked` 均通过 `io.cp` 双向透传，不缓冲整个 body |
 | 绝对 URL 与 origin form | ✅ | `GET http://host/path` 与 `GET /path` 均支持 |
+| 客户端 keep-alive | ✅ | HTTP/1.1 默认复用；CONNECT / WebSocket / chunked 请求体为一次性连接 |
 
 ### 不支持的请求
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| 客户端 keep-alive 连接复用 | ❌ | **每 TCP 连接单请求**，无 keep-alive 循环；错误响应均带 `Connection: close` |
 | HTTPS 中间人 / TLS 解密 | ❌ | 仅 CONNECT 隧道透传，不做 MITM |
 | HTTP/2 | ❌ | 仅 HTTP/1.1 明文与隧道 |
 | 缓存 / 透明代理 | ❌ | 纯转发，无缓存；不拦截 80 端口流量（需配合 iptables 等） |
@@ -44,8 +44,8 @@
 | --- | --- | --- |
 | BIND（RFC 1928 §4.2） | ❌ | 返回 `rep=7 command_not_supported` |
 | UDP ASSOCIATE（RFC 1928 §4.3） | ❌ | 返回 `rep=7 command_not_supported` |
-| 强制认证 | ❌ | 配置凭据后仅「优先选择」RFC 1929；客户端只声明 no-auth 时仍放行 |
 
+> 配置 `SOCKS5_AUTH_USERNAME/PASSWORD` 时，客户端必须支持 RFC 1929；`SOCKS5_NO_AUTH=1` 或 `--no-auth` 可显式关闭认证。
 > BIND / UDP ASSOCIATE 的实现需要 UDP 转发或 BIND 监听状态机，相关工作讨论见 issue #3。
 > 早期 README 曾声称 UDP ASSOCIATE 已支持，与实际代码不符，已修正。
 

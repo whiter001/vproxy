@@ -65,11 +65,9 @@ PROXY_LISTEN_ADDR=:7777 ./proxy.1  # env 生效
 
 ## Keep-alive 行为
 
-当前实现为**每 TCP 连接单请求**：`handle_client` 只读取一次请求头（`read_request_head`）、处理并中继，
-随后返回并关闭连接，**没有 keep-alive 循环**——不解析 `Connection: keep-alive`，也不复用连接处理后续请求。
-错误响应（`400/405/502`）与 `407` 均带 `Connection: close`。
-
-如需复用连接，请在客户端侧使用连接池；每请求一次握手与 TLS 成本无法在代理侧复用。
+当前实现支持客户端 keep-alive：`handle_client` 会在同一 TCP 连接上循环处理请求，
+HTTP/1.1 默认复用，`Connection: close` 会关闭连接；错误响应（`400/405/502`）与 `407` 仍会关闭连接。
+CONNECT、WebSocket 和 chunked 请求体使用一次性连接。
 
 ## 最大 Header 大小
 

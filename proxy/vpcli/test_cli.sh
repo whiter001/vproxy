@@ -272,36 +272,32 @@ fi
 cleanup_pid "$pid"
 
 # ---------------------------------------------------------------------------
-echo "--- 测试 12: 配置 user/pass 时仅声明 no-auth 一律拒绝（安全修复） ---"
-# 关键：一旦配置了 user/pass（此处走 env），客户端只声明 0x00 no-auth 必须被
-# 0xff 拒绝，绝不回退到免认证放行（防鉴权绕过）。注意 SOCKS5_NO_AUTH=1 虽已
-# 解析进 cfg.no_auth，但运行时尚未消费（见 review 残留风险），故即使带上该
-# env，no-auth 客户端仍应被拒绝。
+echo "--- 测试 12: SOCKS5_NO_AUTH 覆盖配置的 user/pass ---"
 SOCKS5_AUTH_USERNAME=env_u SOCKS5_AUTH_PASSWORD=env_p \
 SOCKS5_NO_AUTH=1 \
 "$socks5_bin" -l 127.0.0.1:9998 > /tmp/cli_s.log 2>&1 &
 pid=$!
 sleep 0.8
-# Python 客户端用 no-auth 应被拒绝（0xff）
+# Python 客户端用 no-auth 应被接受（0x00）
 python3 - <<PY
 import socket, sys
 try:
     s = socket.create_connection(('127.0.0.1', 9998), timeout=3)
     s.sendall(b'\x05\x01\x00')
     rep = s.recv(2)
-    if rep == b'\x05\xff':
-        print('NOAUTH_REJECTED')
+    if rep == b'\x05\x00':
+        print('NOAUTH_ACCEPTED')
     else:
-        print(f'NOAUTH_ACCEPTED: rep={rep!r}', file=sys.stderr)
+        print(f'NOAUTH_REJECTED: rep={rep!r}', file=sys.stderr)
         sys.exit(1)
 finally:
     s.close()
 PY
 noauth_rc=$?
 if [[ $noauth_rc -eq 0 ]]; then
-    echo "✅ 配置 user/pass 时 no-auth 客户端被 0xff 拒绝（安全修复）"
+    echo "✅ SOCKS5_NO_AUTH=1 覆盖 user/pass，no-auth 客户端获 0x00"
 else
-    echo "❌ no-auth 未被拒绝（鉴权绕过漏洞仍存在）"
+    echo "❌ SOCKS5_NO_AUTH=1 未生效"
     cat /tmp/cli_s.log
     failed=$((failed + 1))
 fi

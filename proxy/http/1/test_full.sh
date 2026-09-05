@@ -9,7 +9,7 @@ cd "$script_dir"
 
 PROXY_BINARY="./proxy.1"
 V_SOURCE="./proxy.1.v"
-PORT=5777
+PORT=5797
 HTTP_UPSTREAM_PORT=18080
 CONNECT_UPSTREAM_PORT=18081
 USER="testuser"
@@ -198,7 +198,7 @@ wait_for_port "127.0.0.1" "$HTTP_UPSTREAM_PORT"
 wait_for_port "127.0.0.1" "$CONNECT_UPSTREAM_PORT"
 
 echo "--- 启动代理 ---"
-$PROXY_BINARY > "$WORK_DIR/proxy.log" 2>&1 &
+PROXY_LISTEN_ADDR="127.0.0.1:$PORT" $PROXY_BINARY > "$WORK_DIR/proxy.log" 2>&1 &
 PROXY_PID=$!
 wait_for_port "127.0.0.1" "$PORT"
 
@@ -232,6 +232,21 @@ if ! grep -q "HEADER Proxy-Agent: V-Proxy/1.0" "$UPSTREAM_LOG"; then
     failed=$((failed + 1))
 fi
 echo "✅ 上游未收到代理泄露头部，且看到了 Via / Proxy-Agent"
+
+echo "--- 测试 2b: 源站 Authorization 头应保留 ---"
+: > "$UPSTREAM_LOG"
+STATUS=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" \
+    --proxy "http://127.0.0.1:$PORT" \
+    --proxy-user "$USER:$PASS" \
+    -H "Authorization: Bearer origin-token" \
+    "http://127.0.0.1:$HTTP_UPSTREAM_PORT/headers")
+assert_eq "200" "$STATUS" "带源站 Authorization 请求成功"
+if grep -q "HEADER Authorization: Bearer origin-token" "$UPSTREAM_LOG"; then
+    echo "✅ 源站 Authorization 未被代理吞掉"
+else
+    echo "❌ 源站未收到 Authorization 头"
+    failed=$((failed + 1))
+fi
 
 echo "--- 测试 3: Chunked Encoding POST ---"
 : > "$UPSTREAM_LOG"
@@ -307,7 +322,7 @@ echo "--- 测试 5: HEAD 请求 → 响应无 body ---"
 # upstream_servers.py 的 HEAD handler 返回 Content-Length: 11 但只发 header。
 python3 - <<PY
 import socket, base64
-s = socket.create_connection(("127.0.0.1", 5777), timeout=5)
+s = socket.create_connection(("127.0.0.1", $PORT), timeout=5)
 auth = base64.b64encode(b'testuser:testpass').decode()
 req = (
     f"HEAD http://127.0.0.1:$HTTP_UPSTREAM_PORT/ HTTP/1.1\r\n"
@@ -351,12 +366,12 @@ echo "--- 测试 6: 畸形请求 → 400 Bad Request ---"
 # proxy.1.v:159-165 处理畸形首行（少于 3 段、超过 3 段、空首行等）。
 # 注：auth 检查在首行检查之前（proxy.1.v:186-196），所以畸形请求必须带
 # Proxy-Authorization 才能走到 400 路径，否则会被 407 拦截。
-python3 - <<'PY'
+python3 - <<PY
 import socket, base64
 auth = base64.b64encode(b'testuser:testpass').decode()
 
 def send_and_recv(payload):
-    s = socket.create_connection(("127.0.0.1", 5777), timeout=5)
+    s = socket.create_connection(("127.0.0.1", $PORT), timeout=5)
     s.sendall(payload)
     resp = b""
     s.settimeout(2)

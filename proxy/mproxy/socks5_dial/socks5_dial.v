@@ -101,7 +101,7 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 	}
 
 	mut greet := []u8{len: 2}
-	sock.read(mut greet) or { return error('read greeting reply: ${err}') }
+	read_exact(mut sock, mut greet) or { return error('read greeting reply: ${err}') }
 	if greet[0] != socks5_version {
 		sock.close() or {}
 		return error('SOCKS5 version mismatch: ${greet[0]}')
@@ -122,7 +122,7 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 		sock.write(auth_pkt) or { return error('write userpass: ${err}') }
 
 		mut auth_rep := []u8{len: 2}
-		sock.read(mut auth_rep) or { return error('read userpass reply: ${err}') }
+		read_exact(mut sock, mut auth_rep) or { return error('read userpass reply: ${err}') }
 		if auth_rep[1] != socks5_userpass_success {
 			sock.close() or {}
 			return error('SOCKS5 userpass auth failed (status=${auth_rep[1]})')
@@ -146,9 +146,7 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 		if parts.len == 4 {
 			req << socks5_atyp_ipv4
 			for p in parts {
-				n := p.u8()
-				if n > 127 {
-					// u8 returns 0 on parse fail; treat as error
+				n := parse_ipv4_octet(p) or {
 					sock.close() or {}
 					return error('invalid IPv4 octet "${p}"')
 				}
@@ -175,7 +173,7 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 
 	// reply: 至少 4 字节头（VER REP RSV ATYP），加上 BND.ADDR + BND.PORT
 	mut reply_hdr := []u8{len: 4}
-	sock.read(mut reply_hdr) or { return error('read CONNECT reply: ${err}') }
+	read_exact(mut sock, mut reply_hdr) or { return error('read CONNECT reply: ${err}') }
 	if reply_hdr[1] != 0 {
 		sock.close() or {}
 		return error('SOCKS5 CONNECT refused (rep=${reply_hdr[1]})')
@@ -184,17 +182,17 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 	match reply_hdr[3] {
 		socks5_atyp_ipv4 {
 			mut bnd := []u8{len: 4 + 2}
-			sock.read(mut bnd) or { return error('read BND: ${err}') }
+			read_exact(mut sock, mut bnd) or { return error('read BND: ${err}') }
 		}
 		socks5_atyp_ipv6 {
 			mut bnd := []u8{len: 16 + 2}
-			sock.read(mut bnd) or { return error('read BND: ${err}') }
+			read_exact(mut sock, mut bnd) or { return error('read BND: ${err}') }
 		}
 		socks5_atyp_domain {
 			mut len_buf := []u8{len: 1}
-			sock.read(mut len_buf) or { return error('read BND domain len: ${err}') }
+			read_exact(mut sock, mut len_buf) or { return error('read BND domain len: ${err}') }
 			mut bnd := []u8{len: int(len_buf[0]) + 2}
-			sock.read(mut bnd) or { return error('read BND: ${err}') }
+			read_exact(mut sock, mut bnd) or { return error('read BND: ${err}') }
 		}
 		else {
 			sock.close() or {}
@@ -204,6 +202,17 @@ pub fn dial(cfg UpstreamConfig, target_host string, target_port u16) !&net.TcpCo
 
 	// 转移所有权：sock 是 mut 绑定，V 视为 &net.TcpConn；按签名直接返回
 	return sock
+}
+
+fn read_exact(mut sock net.TcpConn, mut buf []u8) ! {
+	mut total := 0
+	for total < buf.len {
+		n := sock.read(mut buf[total..])!
+		if n <= 0 {
+			return error('unexpected EOF')
+		}
+		total += n
+	}
 }
 
 // 块作用：检查字符串是否全是数字和点（IPv4 字面量粗判）
@@ -219,4 +228,15 @@ fn is_all_digits_and_dots(s string) bool {
 		}
 	}
 	return true
+}
+
+fn parse_ipv4_octet(s string) !u8 {
+	if s == '' {
+		return error('empty IPv4 octet')
+	}
+	n := s.int()
+	if n < 0 || n > 255 {
+		return error('IPv4 octet out of range')
+	}
+	return u8(n)
 }

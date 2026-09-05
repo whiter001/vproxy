@@ -39,34 +39,8 @@ flowchart LR
 
 ### Docker
 
-```bash
-docker run --rm -p 5777:5777 \
-  -e PROXY_AUTH_USER=foo -e PROXY_AUTH_PASS=bar \
-  ghcr.io/whiter001/vproxy:latest
-```
-
-> 镜像由项目发布流程构建推送。仓库内不含 Dockerfile 时，请按下方「本地构建运行」自行编译。
-
-### Docker Compose
-
-```yaml
-services:
-  vproxy:
-    image: ghcr.io/whiter001/vproxy:latest
-    container_name: vproxy
-    restart: unless-stopped
-    ports:
-      - "5777:5777"
-    environment:
-      PROXY_LISTEN_ADDR: "0.0.0.0:5777"
-      PROXY_AUTH_USER: "foo"
-      PROXY_AUTH_PASS: "bar"
-```
-
-```bash
-docker compose up -d
-curl -x foo:bar@127.0.0.1:5777 https://httpbin.org/get
-```
+仓库当前未提供 Dockerfile 或公开发布的容器镜像。请先按下方「本地构建运行」编译二进制，
+再自行制作镜像；不要依赖未由本仓库发布流程生成的 `ghcr.io/whiter001/vproxy` 镜像。
 
 ### 本地构建运行
 
@@ -116,8 +90,9 @@ Push 到 `main` 或创建 PR 时，GitHub Actions 会执行：
 - V 代码格式检查
 - 多平台编译检查（http / socks5 / socks4 / mproxy × linux / darwin / windows）
 - V 单元测试（`v test`，覆盖 xor / socks5_dial / lifecycle / HTTP 代理纯函数）
-- `scripts/test_real.sh` 真网端到端（HTTP / SOCKS5 / SOCKS4 → httpbin.org，含鉴权拒绝用例）
 - 本地集成测试（WebSocket / SOCKS4 / lifecycle / CLI / mproxy，无外网依赖）
+
+Nightly workflow 另行运行依赖外网的 `scripts/test_real.sh`。
 
 ### 单元测试
 

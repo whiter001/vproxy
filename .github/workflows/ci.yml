@@ -114,6 +114,11 @@ jobs:
         run: |
           bash proxy/http/1/test_full.sh
 
+      - name: Run HTTP keep-alive test
+        shell: bash
+        run: |
+          bash proxy/http/1/test_keepalive.sh
+
       - name: Run SOCKS5 full test (local upstreams)
         shell: bash
         run: |

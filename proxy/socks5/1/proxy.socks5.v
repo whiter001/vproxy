@@ -57,24 +57,25 @@ fn main() {
 	}
 
 	listen_addr := cfg.listen_addr
-	expected_user := cfg.auth_user
-	expected_pass := cfg.auth_pass
+	// --no-auth / SOCKS5_NO_AUTH=1 must override configured credentials.
+	expected_user := if cfg.no_auth { '' } else { cfg.auth_user }
+	expected_pass := if cfg.no_auth { '' } else { cfg.auth_pass }
 
 	if cfg.config_file != '' {
 		eprintln('Config loaded from ${cfg.config_file}')
 	}
 	// 打印生效配置：auth.password 打码，避免敏感信息进启动日志
 	vpcli.print_effective_config(vpcli.EffectiveConfig{
-		label:        'socks5'
-		listen_addr:  cfg.listen_addr
-		auth_user:    cfg.auth_user
-		auth_pass:    cfg.auth_pass
-		log_level:    cfg.log_level
-		log_format:   cfg.log_format
+		label: 'socks5'
+		listen_addr: cfg.listen_addr
+		auth_user: cfg.auth_user
+		auth_pass: cfg.auth_pass
+		log_level: cfg.log_level
+		log_format: cfg.log_format
 		metrics_addr: cfg.metrics_addr
 		idle_timeout: cfg.idle_timeout
-		allow_rules:  cfg.allow_rules
-		deny_rules:   cfg.deny_rules
+		allow_rules: cfg.allow_rules
+		deny_rules: cfg.deny_rules
 	})
 
 	lifecycle.install_signal_handlers()
@@ -145,12 +146,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, e
 
 fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
 	mut greeting := []u8{len: 2}
-	n := socket.read(mut greeting) or {
+	read_exact(mut socket, mut greeting) or {
 		eprintln('Failed to read greeting: ${err}')
-		return false
-	}
-	if n < 2 {
-		eprintln('Greeting too short')
 		return false
 	}
 
@@ -164,13 +161,9 @@ fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expect
 	}
 
 	mut methods := []u8{len: int(nmethods)}
-	mut read := 0
-	for read < int(nmethods) {
-		r := socket.read(mut methods[read..]) or { break }
-		if r <= 0 {
-			break
-		}
-		read += r
+	read_exact(mut socket, mut methods) or {
+		eprintln('Failed to read methods: ${err}')
+		return false
 	}
 
 	auth_username := expected_user
@@ -200,11 +193,8 @@ fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expect
 
 fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
 	mut header := []u8{len: 2}
-	n := socket.read(mut header) or {
+	read_exact(mut socket, mut header) or {
 		eprintln('Failed to read auth header: ${err}')
-		return false
-	}
-	if n < 2 {
 		return false
 	}
 
@@ -217,27 +207,17 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 	}
 
 	mut user_bytes := []u8{len: user_len}
-	mut read := 0
-	for read < user_len {
-		r := socket.read(mut user_bytes[read..]) or { break }
-		if r <= 0 {
-			break
-		}
-		read += r
+	read_exact(mut socket, mut user_bytes) or {
+		return false
 	}
 
 	mut pass_len_buf := []u8{len: 1}
-	socket.read(mut pass_len_buf) or {}
+	read_exact(mut socket, mut pass_len_buf) or { return false }
 	pass_len := int(pass_len_buf[0])
 
 	mut pass_bytes := []u8{len: pass_len}
-	read = 0
-	for read < pass_len {
-		r := socket.read(mut pass_bytes[read..]) or { break }
-		if r <= 0 {
-			break
-		}
-		read += r
+	read_exact(mut socket, mut pass_bytes) or {
+		return false
 	}
 
 	user := user_bytes.bytestr()
@@ -254,12 +234,8 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 
 fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 	mut header := []u8{len: 4}
-	n := socket.read(mut header) or {
+	read_exact(mut socket, mut header) or {
 		eprintln('Failed to read request header: ${err}')
-		send_reply(mut socket, socks5_rep_server_failure, socks5_atyp_ipv4, 0)
-		return
-	}
-	if n < 4 {
 		send_reply(mut socket, socks5_rep_server_failure, socks5_atyp_ipv4, 0)
 		return
 	}
@@ -286,25 +262,43 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 	match atyp {
 		socks5_atyp_ipv4 {
 			mut addr := []u8{len: 4}
-			socket.read(mut addr) or {}
+			read_exact(mut socket, mut addr) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			target_host = addr.map(it.str()).join('.')
 			mut port := []u8{len: 2}
-			socket.read(mut port) or {}
+			read_exact(mut socket, mut port) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			target_port = (u16(port[0]) << 8) | u16(port[1])
 		}
 		socks5_atyp_domain {
 			mut domain_len := []u8{len: 1}
-			socket.read(mut domain_len) or {}
+			read_exact(mut socket, mut domain_len) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			mut domain_bytes := []u8{len: int(domain_len[0])}
-			socket.read(mut domain_bytes) or {}
+			read_exact(mut socket, mut domain_bytes) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			target_host = domain_bytes.bytestr()
 			mut port := []u8{len: 2}
-			socket.read(mut port) or {}
+			read_exact(mut socket, mut port) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			target_port = (u16(port[0]) << 8) | u16(port[1])
 		}
 		socks5_atyp_ipv6 {
 			mut addr := []u8{len: 16}
-			socket.read(mut addr) or {}
+			read_exact(mut socket, mut addr) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			mut parts := []string{len: 8}
 			// issue #3: hex() 会去前导 0，拼接成 `2001:db8:0:0:...:1` 这种带零段的串
 			// 在某些严格客户端会被拒绝。hex_full() 固定 4 位零填充，得到 RFC 5952 标准形式。
@@ -314,7 +308,10 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 			}
 			target_host = parts.join(':')
 			mut port := []u8{len: 2}
-			socket.read(mut port) or {}
+			read_exact(mut socket, mut port) or {
+				send_reply(mut socket, socks5_rep_server_failure, atyp, 0)
+				return
+			}
 			target_port = (u16(port[0]) << 8) | u16(port[1])
 		}
 		else {
@@ -415,4 +412,16 @@ fn send_reply(mut socket net.TcpConn, rep u8, req_atyp u8, bind_port u16) {
 	}
 
 	socket.write(reply) or { eprintln('Failed to send reply: ${err}') }
+}
+
+// TCP read may return fewer bytes than requested; protocol fields must be read in full.
+fn read_exact(mut socket net.TcpConn, mut buf []u8) ! {
+	mut total := 0
+	for total < buf.len {
+		n := socket.read(mut buf[total..])!
+		if n <= 0 {
+			return error('unexpected EOF')
+		}
+		total += n
+	}
 }

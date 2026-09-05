@@ -42,8 +42,7 @@ fn main() {
 		return
 	}
 
-	expected_auth, require_auth := proxy_auth_config(cfg.auth_basic, cfg.auth_user, cfg.auth_pass,
-		cfg.require_auth) or {
+	expected_auth, require_auth := proxy_auth_config(cfg.auth_basic, cfg.auth_user, cfg.auth_pass, cfg.require_auth) or {
 		eprintln('Error: ${err}')
 		eprintln('       Set PROXY_AUTH_USER and PROXY_AUTH_PASS,')
 		eprintln('       or PROXY_AUTH_BASIC=<base64(user:pass)>,')
@@ -56,17 +55,17 @@ fn main() {
 	}
 	// 打印生效配置：password / auth_basic 一律打码，避免敏感信息进启动日志
 	vpcli.print_effective_config(vpcli.EffectiveConfig{
-		label:        'http'
-		listen_addr:  cfg.listen_addr
-		auth_user:    cfg.auth_user
-		auth_pass:    cfg.auth_pass
-		auth_basic:   cfg.auth_basic
-		log_level:    cfg.log_level
-		log_format:   cfg.log_format
+		label: 'http'
+		listen_addr: cfg.listen_addr
+		auth_user: cfg.auth_user
+		auth_pass: cfg.auth_pass
+		auth_basic: cfg.auth_basic
+		log_level: cfg.log_level
+		log_format: cfg.log_format
 		metrics_addr: cfg.metrics_addr
 		idle_timeout: cfg.idle_timeout
-		allow_rules:  cfg.allow_rules
-		deny_rules:   cfg.deny_rules
+		allow_rules: cfg.allow_rules
+		deny_rules: cfg.deny_rules
 	})
 
 	lifecycle.install_signal_handlers()
@@ -172,8 +171,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	// 超出部分），作为下一轮读取的初始缓冲，避免被静默丢弃。
 	mut carry_body := []u8{}
 	for {
-		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur,
-			first_request, mut carry_body) or { break }
+		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur, first_request, mut carry_body) or { break }
 		first_request = false
 		if !keep_alive {
 			break
@@ -232,7 +230,7 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		if line == '' {
 			continue
 		}
-		if starts_with_ci(line, 'proxy-authorization:') || starts_with_ci(line, 'authorization:') {
+		if starts_with_ci(line, 'proxy-authorization:') {
 			proxy_authorization = line.all_after(':').trim_space()
 		} else if starts_with_ci(line, 'host:') {
 			host_header = line.all_after(':').trim_space()
@@ -360,7 +358,6 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 				continue
 			}
 			if starts_with_ci(line, 'proxy-authorization:')
-				|| starts_with_ci(line, 'authorization:')
 				|| starts_with_ci(line, 'proxy-connection:') {
 				continue
 			}
@@ -449,7 +446,6 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 			// 移除代理相关的头部，防止循环代理或泄露验证信息；
 			// 同时剥离 Connection / Proxy-Connection（由代理统一管理 keep-alive 语义）
 			if starts_with_ci(line, 'proxy-authorization:')
-				|| starts_with_ci(line, 'authorization:')
 				|| starts_with_ci(line, 'proxy-connection:') || starts_with_ci(line, 'connection:') {
 				continue
 			}

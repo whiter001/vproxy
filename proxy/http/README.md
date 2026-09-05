@@ -15,12 +15,8 @@
 
 ## Keep-alive 行为
 
-**当前实现为每 TCP 连接单请求**：`handle_client` 只读取一次请求头、处理、中继、返回并关闭连接，
-**没有 keep-alive 循环**（不解析 `Connection: keep-alive`，不复用连接处理后续请求）。
-错误响应（`400/405/502`）与 `407` 均带 `Connection: close`。
-
-因此每请求一次握手 + 一次 TLS 的成本无法复用；高并发长连接场景可搭配连接池客户端。
-历史 PR #16（issue #2）曾尝试支持 keep-alive，但当前 main 未包含该实现。
+当前实现支持客户端 keep-alive：HTTP/1.1 默认复用连接，`Connection: close` 或错误响应会关闭连接。
+CONNECT、WebSocket 和 chunked 请求体使用一次性连接；上游连接仍按请求独立建立。
 
 ## 最大 Header 大小
 
