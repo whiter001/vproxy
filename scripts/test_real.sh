@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # 真网端到端实测脚本：HTTP / SOCKS5 / SOCKS4 代理 → httpbin.org。
 #
 # 从 CI 内联用例抽出，可在本地直接复用：

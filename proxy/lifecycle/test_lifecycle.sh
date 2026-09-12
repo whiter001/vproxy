@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # issue #5 回归测试：HTTP + SOCKS5 代理的 lifecycle 行为。
 #
 # 覆盖：

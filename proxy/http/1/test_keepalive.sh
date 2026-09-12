@@ -1,4 +1,9 @@
 #!/bin/bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # keep-alive / CONNECT Via / HEAD 独立路径集成测试。
 #
 # 覆盖（对应需求验收项）：

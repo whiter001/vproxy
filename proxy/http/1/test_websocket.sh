@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # HTTP/1.1 WebSocket 代理回归测试（RFC 6455）。
 #
 # 覆盖：

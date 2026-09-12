@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # 回归测试：HTTP 代理在 dial 上游失败时返回 502 Bad Gateway。
 #
 # 覆盖 proxy.1.v 的 net.dial_tcp() 失败分支：

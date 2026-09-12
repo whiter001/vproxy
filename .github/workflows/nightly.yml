@@ -1,12 +1,10 @@
 name: Nightly
 
-# 每日 03:00 UTC 运行外网烟测（httpbin.org）与 -prod 性能基准（wrk）。
+# 外网烟测（httpbin.org）与 -prod 性能基准（wrk），手动触发（Actions 页面 Run workflow）。
 # 外网依赖偶发抖动，不适合放 CI 主流程（push/PR 必须全本地、3 分钟内稳定通过），
 # 因此统一移到这里，失败不影响主流程。
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,6 +13,9 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-latest
+
+    env:
+      VFLAGS: -enable-globals
 
     steps:
       - name: Checkout
@@ -33,6 +34,9 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
+
+    env:
+      VFLAGS: -enable-globals
 
     steps:
       - name: Checkout

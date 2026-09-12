@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # wrk 吞吐基准：v -prod 编译 HTTP 代理 → 本地 HTTP 上游 → wrk 打代理。
 #
 # 用法：

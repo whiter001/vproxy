@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # 并发中继回归测试：验证 io.cp 双向中继 teardown 的「双 close 竞态」已修复。
 #
 # 背景：旧实现的两个 relay goroutine 各自 defer close(src)+close(dst)，同一 fd 被并发

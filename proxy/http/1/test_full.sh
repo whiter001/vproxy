@@ -1,4 +1,9 @@
 #!/bin/bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # 自动测试脚本：验证 vproxy 的认证、头部转发、CONNECT 隧道及 Chunked 支持。
 # 所有上游都在本地启动，避免外网波动导致误判。
 

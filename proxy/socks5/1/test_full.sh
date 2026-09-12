@@ -1,4 +1,9 @@
 #!/bin/bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # SOCKS5 全量本地测试：本地 TCP echo 上游 + CONNECT 隧道 + 鉴权成功/失败。
 # 原 test_full.sh 的 4 个用例全部依赖 httpbin.org 外网，改造成与 HTTP 版
 # test_full.sh 一致的全本地模式，CI 主流程可直接运行，无外网抖动。

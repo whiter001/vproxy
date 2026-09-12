@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# lifecycle 模块使用 __global 可变全局变量，编译代理需 -enable-globals
+case " ${VFLAGS:-} " in
+  *" -enable-globals "*) ;;
+  *) export VFLAGS="${VFLAGS:-} -enable-globals" ;;
+esac
 # issue #1 回归测试：
 #   1. 未配置凭据时进程 fail-fast（exit code != 0）
 #   2. PROXY_REQUIRE_AUTH=0 时启动成功且免认证可转发

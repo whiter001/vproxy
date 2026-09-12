@@ -30,7 +30,10 @@ pub const default_idle_timeout_seconds = 300
 
 // 模块级 atomic stop flag。signal handler 仅写入；主循环用 should_stop() 轮询。
 // 注意：仅在 main 线程上轮询才能及时响应信号；goroutine 里读也能用，但响应延迟。
-const stop_flag = i64(0)
+// 必须是真正的可变全局变量（`__global`），不能用 `const`：
+// `const` 没有稳定的可写内存地址，对其取地址做原子读写会在运行时触发
+// invalid memory access（见 CI nightly 失败 34669353553）。
+__global stop_flag = i64(0)
 
 fn signal_handler(_sig os.Signal) {
 	// signal context 里只做原子写；不做 V 高级操作（不可重入 / 不可阻塞）。

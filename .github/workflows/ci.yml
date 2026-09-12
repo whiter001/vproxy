@@ -76,7 +76,7 @@ jobs:
       - name: Build ${{ matrix.proxy }} proxy
         shell: bash
         env:
-          VFLAGS: ${{ matrix.vflags }}
+          VFLAGS: ${{ matrix.vflags }} -enable-globals
         run: |
           mkdir -p ./bin
           v -o ./bin/proxy.${{ matrix.proxy }}.${{ matrix.target }}${{ matrix.bin_ext }} ${{ matrix.src }}
@@ -91,6 +91,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: format
     timeout-minutes: 3
+
+    env:
+      VFLAGS: -enable-globals
 
     steps:
       - name: Checkout
@@ -127,6 +130,9 @@ jobs:
   test-websocket:
     runs-on: ubuntu-latest
     needs: format
+
+    env:
+      VFLAGS: -enable-globals
 
     steps:
       - name: Checkout
