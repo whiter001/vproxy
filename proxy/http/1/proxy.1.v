@@ -9,6 +9,7 @@ import policy
 import sync
 import sync.stdatomic
 import time
+import upstream as upx
 import vpcli
 
 const valid_methods = ['CONNECT', 'POST', 'GET', 'HEAD', 'OPTIONS', 'DELETE', 'PATCH', 'PUT']
@@ -51,6 +52,19 @@ fn main() {
 		C.exit(1)
 	}
 
+	// 上级代理（issue #27）：配置了 --parent 则全部流量经上级转发（强制走上级）；
+	// URL 非法时 fail-fast，不以半可用状态启动。
+	mut parent := ?upx.Parent(none)
+	mut parent_safe := ''
+	if cfg.parent != '' {
+		p := upx.parse_parent(cfg.parent) or {
+			eprintln('Error: invalid --parent "${cfg.parent}": ${err}')
+			C.exit(1)
+		}
+		parent = p
+		parent_safe = p.safe_str()
+	}
+
 	if cfg.config_file != '' {
 		eprintln('Config loaded from ${cfg.config_file}')
 	}
@@ -69,6 +83,7 @@ fn main() {
 		deny_rules:   cfg.deny_rules
 		client_allow: cfg.client_allow
 		client_deny:  cfg.client_deny
+		parent:       parent_safe
 	})
 
 	// 策略配置（issue #30）：目标域名黑白名单 + 客户端 IP 黑白名单
@@ -116,7 +131,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, expected_auth, require_auth, idle_dur, rules)
+		go handle_client(mut socket, stats, expected_auth, require_auth, idle_dur, rules, parent)
 	}
 
 	// 等所有 in-flight handle_client 退出后 main 返回，进程退出码 0
@@ -163,7 +178,7 @@ fn proxy_auth_config(auth_basic string, user string, pass string, require_auth b
 //    idle timeout / 客户端关闭 / 错误响应（Connection: close）。
 // 7. issue #30：accept 后先做客户端 IP 黑白名单判定，拒绝则直接关闭。
 fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool,
-	idle_dur time.Duration, rules policy.Rules) {
+	idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -191,7 +206,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	mut carry_body := []u8{}
 	for {
 		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur, first_request, mut
-			carry_body, rules) or { break }
+			carry_body, rules, parent) or { break }
 		first_request = false
 		if !keep_alive {
 			break
@@ -208,7 +223,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 // 返回 true 表示客户端连接可复用；false 或 error 表示连接关闭。
 // error 仅在读取失败 / 上游关闭时返回，不发送响应；首请求解析失败会先发 400。
 fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bool,
-	idle_dur time.Duration, first_request bool, mut carry_body []u8, rules policy.Rules) !bool {
+	idle_dur time.Duration, first_request bool, mut carry_body []u8, rules policy.Rules, parent ?upx.Parent) !bool {
 	header_bytes, mut pending_body := read_request_head(mut socket, carry_body) or {
 		if first_request {
 			send_simple_response(mut socket, '400 Bad Request', '${err}\n')
@@ -340,6 +355,14 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		forwarded_first_line = '${method} ${request_path} ${version}'
 	}
 
+	// 上级为 HTTP 代理时（issue #27）：CONNECT 之外的请求行改发 absolute-form，
+	// 上级按普通正向代理处理；CONNECT 与 socks5 上级维持 origin-form / 隧道语义。
+	if p := parent {
+		if p.scheme == .http && method != 'CONNECT' {
+			forwarded_first_line = '${method} http://${upstream_host}${request_path} ${version}'
+		}
+	}
+
 	// 目标域名黑白名单（issue #30）：拨号前判定，拒绝则 403 并关闭。
 	// upstream_host 形如 "host:port"，判定前剥掉端口（IPv6 边界情况保留原值）。
 	mut target_name := upstream_host
@@ -352,7 +375,8 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		return error('close')
 	}
 
-	mut upstream := net.dial_tcp(upstream_host) or {
+	// 配置了 parent 则经上级建连（issue #27），否则直连目标。
+	mut upstream := dial_target(upstream_host, method, parent) or {
 		eprintln('Failed to connect to ${upstream_host}: ${err}')
 		send_simple_response(mut socket, '502 Bad Gateway', 'Upstream connection failed: ${err}\n')
 		return error('close')
@@ -400,6 +424,12 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		}
 		if !has_host_header && upstream_host != '' {
 			ws_headers << 'Host: ${upstream_host}'
+		}
+		// 上级为带认证的 HTTP 代理时注入上级凭据（issue #27）
+		if p := parent {
+			if p.scheme == .http && p.user != '' {
+				ws_headers << 'Proxy-Authorization: Basic ${base64.encode_str('${p.user}:${p.pass}')}'
+			}
 		}
 		ws_headers << ''
 		request_blob := ws_headers.join('\r\n') + '\r\n'
@@ -493,6 +523,13 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		}
 		if !has_host_header && upstream_host != '' {
 			forwarded_headers << 'Host: ${upstream_host}'
+		}
+		// 上级为带认证的 HTTP 代理时注入上级凭据（issue #27）；
+		// 客户端自身的 Proxy-Authorization 已在上面剥离，不会双重携带。
+		if p := parent {
+			if p.scheme == .http && p.user != '' {
+				forwarded_headers << 'Proxy-Authorization: Basic ${base64.encode_str('${p.user}:${p.pass}')}'
+			}
 		}
 		forwarded_headers << 'Via: 1.1 v-proxy'
 		forwarded_headers << 'Proxy-Agent: V-Proxy/1.0'
@@ -635,6 +672,23 @@ fn relay_both_ways(mut a net.TcpConn, mut b net.TcpConn) {
 		io.cp(mut src, mut dst) or {}
 	}(mut b, mut a, mut wg)
 	wg.wait()
+}
+
+// 块作用：按是否配置上级代理选择拨号路径（issue #27）
+// 处理问题：
+// - 未配置 parent：直连目标。
+// - socks5 上级 / CONNECT 方法：经上级建立 CONNECT 隧道（RFC 1928 / RFC 7231）。
+// - http 上级 + 非 CONNECT（明文转发 / WebSocket）：只需直连上级，请求以
+//   absolute-form 发给上级转发；CONNECT 隧道会让上级把流量原样打到目标，
+//   既多一跳协议转换，也会让上级的 407 等响应无法按原语义透传给客户端。
+fn dial_target(target string, method string, parent ?upx.Parent) !&net.TcpConn {
+	if p := parent {
+		if p.scheme == .http && method != 'CONNECT' {
+			return net.dial_tcp('${p.host}:${p.port}')
+		}
+		return p.dial(target)
+	}
+	return net.dial_tcp(target)
 }
 
 // 块作用：目标解析

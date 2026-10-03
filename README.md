@@ -25,7 +25,7 @@ flowchart LR
         P["policy 策略<br/>方法白名单 / RSV 校验<br/>目标与客户端黑白名单（issue #30）"]
         F["forwarder 转发<br/>CONNECT 隧道<br/>io.cp 双向中继（半关闭传播）"]
     end
-    A --> P --> F -->|新建 TCP 连接| U["upstream<br/>目标服务器 / 任意 TCP 服务"]
+    A --> P --> F -->|新建 TCP 连接| U["upstream<br/>目标服务器 / 任意 TCP 服务<br/>或上级代理（--parent，issue #27）"]
 ```
 
 ## ⚠️ 安全提示（生产部署前必读）
@@ -34,6 +34,7 @@ flowchart LR
 - **HTTP 无默认弱口令**：早期版本内置 `user:pwd` 默认凭据，自 issue #1 起已移除。未配置 `PROXY_AUTH_USER`/`PROXY_AUTH_PASS`（且未显式 `PROXY_REQUIRE_AUTH=0`）时进程**直接退出**（fail-fast，退出码 1），不会以默认口令运行。
 - **SOCKS5/SOCKS4 无凭据 = 开放代理**：未设置 `SOCKS5_AUTH_USERNAME` + `SOCKS5_AUTH_PASSWORD` 时，SOCKS5 以**无认证模式**运行；SOCKS4 未设置 `SOCKS4_AUTH_USER` 时接受任意 USERID。**切勿**将这类实例直接暴露到公网。
 - **访问控制**：`proxy.toml` 的 `[rules]` 支持目标域名/客户端 IP 黑白名单（issue #30），语义与规则形式见 [proxy/vpcli/README.md](proxy/vpcli/README.md) 与 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
+- **上级代理级联**：HTTP / SOCKS5 代理支持 `--parent http://[user:pass@]host:port` 或 `--parent socks5://[user:pass@]host:port` 串联上级代理（issue #27）；TLS（`https://`）上级暂不支持，详见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
 - 生产部署清单见 [docs/DEPLOY.md](docs/DEPLOY.md)；漏洞报告流程见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 ## 快速上手

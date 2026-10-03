@@ -8,6 +8,7 @@ import policy
 import sync
 import sync.stdatomic
 import time
+import upstream as upx
 import vpcli
 
 const socks5_version = u8(5)
@@ -63,6 +64,18 @@ fn main() {
 	expected_user := if cfg.no_auth { '' } else { cfg.auth_user }
 	expected_pass := if cfg.no_auth { '' } else { cfg.auth_pass }
 
+	// 上级代理（issue #27）：配置了 --parent 则全部流量经上级转发；URL 非法 fail-fast。
+	mut parent := ?upx.Parent(none)
+	mut parent_safe := ''
+	if cfg.parent != '' {
+		p := upx.parse_parent(cfg.parent) or {
+			eprintln('Error: invalid --parent "${cfg.parent}": ${err}')
+			C.exit(1)
+		}
+		parent = p
+		parent_safe = p.safe_str()
+	}
+
 	if cfg.config_file != '' {
 		eprintln('Config loaded from ${cfg.config_file}')
 	}
@@ -80,6 +93,7 @@ fn main() {
 		deny_rules:   cfg.deny_rules
 		client_allow: cfg.client_allow
 		client_deny:  cfg.client_deny
+		parent:       parent_safe
 	})
 
 	// 策略配置（issue #30）：目标黑白名单 + 客户端 IP 黑白名单
@@ -124,7 +138,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass, rules)
+		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass, rules, parent)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -136,7 +150,7 @@ fn main() {
 }
 
 fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, expected_user string,
-	expected_pass string, rules policy.Rules) {
+	expected_pass string, rules policy.Rules, parent ?upx.Parent) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -160,7 +174,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, e
 		return
 	}
 
-	handle_request(mut socket, idle_dur, rules)
+	handle_request(mut socket, idle_dur, rules, parent)
 }
 
 fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
@@ -251,7 +265,7 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 	return false
 }
 
-fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.Rules) {
+fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent) {
 	mut header := []u8{len: 4}
 	read_exact(mut socket, mut header) or {
 		eprintln('Failed to read request header: ${err}')
@@ -341,7 +355,7 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.R
 
 	match cmd {
 		socks5_cmd_connect {
-			handle_connect(mut socket, target_host, target_port, atyp, idle_dur, rules)
+			handle_connect(mut socket, target_host, target_port, atyp, idle_dur, rules, parent)
 		}
 		else {
 			// BIND / UDP ASSOCIATE 当前未实现（README 已说明）。
@@ -355,8 +369,9 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.R
 // - issue #3：send_reply 用 atyp 输出对应长度（10/22/7+N）
 // - issue #5：upstream 应用 idle timeout
 // - issue #30：拨号前做目标黑白名单判定，拒绝回 rep=2（not allowed by ruleset）
+// - issue #27：配置了 parent 则经上级建连，失败回 rep=5（connection refused）
 fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, atyp u8,
-	idle_dur time.Duration, rules policy.Rules) {
+	idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent) {
 	if !policy.target_allowed(target_host, rules.allow, rules.deny) {
 		eprintln('policy: target ${target_host} denied by rules')
 		send_reply(mut socket, socks5_rep_not_allowed, atyp, 0)
@@ -364,10 +379,18 @@ fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, a
 	}
 
 	addr_str := dial_addr(target_host, target_port, atyp)
-	mut upstream := net.dial_tcp(addr_str) or {
-		eprintln('Failed to connect to ${addr_str}: ${err}')
-		send_reply(mut socket, socks5_rep_connection_refused, atyp, 0)
-		return
+	mut upstream := if p := parent {
+		p.dial(addr_str) or {
+			eprintln('Failed to connect to ${addr_str} via parent ${p.safe_str()}: ${err}')
+			send_reply(mut socket, socks5_rep_connection_refused, atyp, 0)
+			return
+		}
+	} else {
+		net.dial_tcp(addr_str) or {
+			eprintln('Failed to connect to ${addr_str}: ${err}')
+			send_reply(mut socket, socks5_rep_connection_refused, atyp, 0)
+			return
+		}
 	}
 	defer {
 		upstream.close() or {}
