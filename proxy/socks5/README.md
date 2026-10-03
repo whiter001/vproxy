@@ -16,10 +16,11 @@
 | TCP CONNECT | ✅ | 含 IPv4 / Domain / IPv6 三种 atyp |
 | 协议字段校验 | ✅ | 拒绝非零 RSV（issue #3） |
 | BIND | ❌ | 当前返回 `command_not_supported`，未实现 |
-| UDP ASSOCIATE | ❌ | 当前返回 `command_not_supported`，未实现（参见 issue #3） |
+| UDP ASSOCIATE | ✅ | RFC 1928 §4.3（issue #26）；语义与边界见 [docs/PROTOCOL.md](../../docs/PROTOCOL.md) |
 
 > **注意**：早期 README 曾声称「UDP 关联（UDP ASSOCIATE）」已支持，**这是错误的**——
-> 代码对非 CONNECT 命令一律返回 `rep=7 command_not_supported`（`proxy.socks5.v` 的 `handle_request`）。
+> 代码对非 CONNECT 命令一律返回 `rep=7 command_not_supported`；自 issue #26 起真正实现，
+> 含 relay 回收、FRAG 丢弃、目标黑白名单约束（docs/PROTOCOL.md「UDP ASSOCIATE 语义」）。
 > 协议矩阵以本表为准，另见 [docs/PROTOCOL.md](../../docs/PROTOCOL.md)。
 
 ## ⚠️ 安全提示
@@ -65,4 +66,5 @@ curl --socks5-user user:pwd 127.0.0.1:5778 https://httpbin.org/get
 ```bash
 bash proxy/socks5/1/test_protocol.sh   # RFC 1928/1929 协议合规（无外网依赖）
 bash proxy/socks5/1/test_ipv6.sh       # IPv6 目标 + 协议字段校验（issue #3）
+bash proxy/socks5/1/test_udp_associate.sh # UDP ASSOCIATE 端到端（issue #26）
 ```

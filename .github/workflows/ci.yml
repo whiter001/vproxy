@@ -156,6 +156,7 @@ jobs:
           bash proxy/mproxy/1/test_socks5_upstream.sh
           bash proxy/policy/test_policy.sh
           bash proxy/upstream/test_upstream.sh
+          bash proxy/socks5/1/test_udp_associate.sh
 
   release:
     runs-on: ubuntu-latest

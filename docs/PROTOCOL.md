@@ -34,6 +34,7 @@
 | --- | --- | --- |
 | 握手协商（RFC 1928） | ✅ | greeting（VER/NMETHODS/METHODS）+ method 选择 |
 | CONNECT（RFC 1928 §4） | ✅ | 目标地址 IPv4（atyp=1）/ 域名（atyp=3）/ IPv6（atyp=4）均支持 |
+| UDP ASSOCIATE（RFC 1928 §4.3） | ✅ | IPv4 / 域名 / IPv6 目标均可转发；FRAG≠0 丢弃；详见下文「UDP ASSOCIATE 语义」 |
 | RSV 字段校验（RFC 1928） | ✅ | 非零 RSV 拒绝（issue #3） |
 | 用户名/密码认证（RFC 1929） | ✅ | 版本 1 子协议，`SOCKS5_AUTH_USERNAME/PASSWORD` |
 | BND.ADDR 全零 | ✅ | reply 中 BND.ADDR 写 0，端口为 0（RFC 允许，客户端忽略） |
@@ -43,11 +44,20 @@
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
 | BIND（RFC 1928 §4.2） | ❌ | 返回 `rep=7 command_not_supported` |
-| UDP ASSOCIATE（RFC 1928 §4.3） | ❌ | 返回 `rep=7 command_not_supported` |
 
 > 配置 `SOCKS5_AUTH_USERNAME/PASSWORD` 时，客户端必须支持 RFC 1929；`SOCKS5_NO_AUTH=1` 或 `--no-auth` 可显式关闭认证。
-> BIND / UDP ASSOCIATE 的实现需要 UDP 转发或 BIND 监听状态机，相关工作讨论见 issue #3。
-> 早期 README 曾声称 UDP ASSOCIATE 已支持，与实际代码不符，已修正。
+> BIND 的实现需要反向连接监听状态机，相关工作讨论见 issue #3 / #26。
+> 早期 README 曾声称 UDP ASSOCIATE 已支持，与实际代码不符，已修正；自 issue #26 起真正实现。
+
+### UDP ASSOCIATE 语义（issue #26）
+
+- relay 绑定在与 TCP 监听同 host 的地址上（临时端口），reply 的 BND.PORT 为实际端口，BND.ADDR 按惯例回全 0。
+- 客户端身份：首个源 IP 等于 TCP 控制连接对端 IP 的 UDP 数据报发送者；之后仅接受该源（防本机抢注）。
+- 目标 → 客户端回传仅对「客户端先联系过」的目标生效；封装头保留客户端当初使用的 ATYP 形式（域名目标回传域名）。
+- FRAG≠0 的数据报按 RFC 丢弃（不支持分片重组）；目标域名逐报文 resolve（无 DNS 缓存）；目标 family 与 relay socket 不一致时丢弃。
+- 目标黑白名单（issue #30）同样约束 UDP 转发，拒绝即静默丢弃（UDP 无错误应答）。
+- 生命周期：TCP 控制连接断开（含 `--idle-timeout` 无数据超时，默认 300s）即回收 relay；长会话将 `SOCKS5_IDLE_TIMEOUT` 置 0。
+- 级联（`--parent`，issue #27）不穿透 UDP：配置上级时 UDP ASSOCIATE 仍走本机直连。
 
 ## SOCKS4 / SOCKS4a（`proxy/socks4/1/proxy.socks4.v`）
 
@@ -106,6 +116,7 @@ bash proxy/lifecycle/test_lifecycle.sh  # 优雅退出 / idle timeout
 bash proxy/vpcli/test_cli.sh            # CLI 参数解析
 bash proxy/policy/test_policy.sh        # 黑白名单运行时强制（issue #30）
 bash proxy/upstream/test_upstream.sh    # 上级代理级联（issue #27）
+bash proxy/socks5/1/test_udp_associate.sh # UDP ASSOCIATE（issue #26）
 ```
 
 真网端到端（依赖 httpbin.org，不可达时跳过）：
