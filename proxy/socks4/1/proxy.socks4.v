@@ -123,7 +123,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, ski
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	request := parse_request(mut socket) or {

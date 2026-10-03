@@ -161,7 +161,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	// keep-alive 循环：process_request 返回 true 表示连接可复用。
