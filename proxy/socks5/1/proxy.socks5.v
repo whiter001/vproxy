@@ -66,16 +66,16 @@ fn main() {
 	}
 	// 打印生效配置：auth.password 打码，避免敏感信息进启动日志
 	vpcli.print_effective_config(vpcli.EffectiveConfig{
-		label: 'socks5'
-		listen_addr: cfg.listen_addr
-		auth_user: cfg.auth_user
-		auth_pass: cfg.auth_pass
-		log_level: cfg.log_level
-		log_format: cfg.log_format
+		label:        'socks5'
+		listen_addr:  cfg.listen_addr
+		auth_user:    cfg.auth_user
+		auth_pass:    cfg.auth_pass
+		log_level:    cfg.log_level
+		log_format:   cfg.log_format
 		metrics_addr: cfg.metrics_addr
 		idle_timeout: cfg.idle_timeout
-		allow_rules: cfg.allow_rules
-		deny_rules: cfg.deny_rules
+		allow_rules:  cfg.allow_rules
+		deny_rules:   cfg.deny_rules
 	})
 
 	lifecycle.install_signal_handlers()
