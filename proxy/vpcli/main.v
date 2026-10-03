@@ -43,6 +43,8 @@ pub mut:
 	metrics_addr string
 	allow_rules  []string
 	deny_rules   []string
+	client_allow []string
+	client_deny  []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -61,6 +63,8 @@ pub mut:
 	metrics_addr string
 	allow_rules  []string
 	deny_rules   []string
+	client_allow []string
+	client_deny  []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -80,6 +84,8 @@ pub mut:
 	metrics_addr string
 	allow_rules  []string
 	deny_rules   []string
+	client_allow []string
+	client_deny  []string
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -191,6 +197,8 @@ pub fn parse_http_args(args []string) !HttpConfig {
 		metrics_addr: file_cfg.metrics_addr
 		allow_rules:  file_cfg.allow_rules
 		deny_rules:   file_cfg.deny_rules
+		client_allow: file_cfg.client_allow
+		client_deny:  file_cfg.client_deny
 		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
@@ -291,6 +299,8 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 		metrics_addr: file_cfg.metrics_addr
 		allow_rules:  file_cfg.allow_rules
 		deny_rules:   file_cfg.deny_rules
+		client_allow: file_cfg.client_allow
+		client_deny:  file_cfg.client_deny
 		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
@@ -388,6 +398,8 @@ pub fn parse_socks4_args(args []string) !Socks4Config {
 		metrics_addr: file_cfg.metrics_addr
 		allow_rules:  file_cfg.allow_rules
 		deny_rules:   file_cfg.deny_rules
+		client_allow: file_cfg.client_allow
+		client_deny:  file_cfg.client_deny
 		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version

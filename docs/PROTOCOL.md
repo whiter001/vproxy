@@ -63,6 +63,18 @@
 - **没有 handshake / 口令字段**：客户端发完请求即收 reply；USERID 仅是标识字段。
 - reply 固定 8 字节（VN + CD + DSTPORT + DSTIP），VN 为 0x00。
 
+## 访问控制（issue #30）
+
+三个代理共用同一套黑白名单（`proxy/policy`），经 `proxy.toml` 的 `[rules]` 配置：
+
+| 键 | 作用 | HTTP 拒绝 | SOCKS5 拒绝 | SOCKS4 拒绝 |
+| --- | --- | --- | --- | --- |
+| `allow` / `deny` | 目标域名 / IP | `403 Forbidden` | `rep=2`（not allowed） | `CD=0x5B`（rejected） |
+| `client_allow` / `client_deny` | 客户端 IP | 直接关闭（无响应） | 直接关闭 | 直接关闭 |
+
+规则形式：精确域名、`*.example.com` 通配（含根域）、IPv4 CIDR、裸 IPv4。
+语义：allow 非空 = 白名单（必须命中）；deny 命中即拒；两表皆空 = 全放行。
+
 ## 验证方式
 
 本地脚本（无外网依赖）验证上述行为：
@@ -78,6 +90,7 @@ bash proxy/socks5/1/test_ipv6.sh        # IPv6 目标 + RSV 校验
 bash proxy/socks4/1/test_protocol.sh    # SOCKS4/4a 协议合规
 bash proxy/lifecycle/test_lifecycle.sh  # 优雅退出 / idle timeout
 bash proxy/vpcli/test_cli.sh            # CLI 参数解析
+bash proxy/policy/test_policy.sh        # 黑白名单运行时强制（issue #30）
 ```
 
 真网端到端（依赖 httpbin.org，不可达时跳过）：

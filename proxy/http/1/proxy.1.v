@@ -5,6 +5,7 @@ import io
 import lifecycle
 import net
 import os
+import policy
 import sync
 import sync.stdatomic
 import time
@@ -66,7 +67,17 @@ fn main() {
 		idle_timeout: cfg.idle_timeout
 		allow_rules:  cfg.allow_rules
 		deny_rules:   cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
 	})
+
+	// 策略配置（issue #30）：目标域名黑白名单 + 客户端 IP 黑白名单
+	rules := policy.Rules{
+		allow:        cfg.allow_rules
+		deny:         cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
+	}
 
 	lifecycle.install_signal_handlers()
 	idle_dur := cfg.idle_timeout
@@ -105,7 +116,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, expected_auth, require_auth, idle_dur)
+		go handle_client(mut socket, stats, expected_auth, require_auth, idle_dur, rules)
 	}
 
 	// 等所有 in-flight handle_client 退出后 main 返回，进程退出码 0
@@ -150,8 +161,9 @@ fn proxy_auth_config(auth_basic string, user string, pass string, require_auth b
 // 5. issue #5：应用 idle timeout；defer 通知 inflight WaitGroup 让优雅退出能 drain
 // 6. keep-alive：复用客户端 socket，循环处理同一连接上的多个请求，直到
 //    idle timeout / 客户端关闭 / 错误响应（Connection: close）。
+// 7. issue #30：accept 后先做客户端 IP 黑白名单判定，拒绝则直接关闭。
 fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool,
-	idle_dur time.Duration) {
+	idle_dur time.Duration, rules policy.Rules) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -164,6 +176,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
+	// 客户端 IP 黑白名单（issue #30）：两表皆空时 client_allowed 恒真，零开销路径。
+	peer := policy.peer_ip(socket) or { '' }
+	if !policy.client_allowed(peer, rules.client_allow, rules.client_deny) {
+		eprintln('policy: client ${peer} denied by client rules')
+		return
+	}
+
 	// keep-alive 循环：process_request 返回 true 表示连接可复用。
 	// 注意：首请求前读到空连接（EOF）会返回 400；已处理过请求后再 EOF 属正常关闭，静默结束。
 	mut first_request := true
@@ -171,7 +190,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 	// 超出部分），作为下一轮读取的初始缓冲，避免被静默丢弃。
 	mut carry_body := []u8{}
 	for {
-		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur, first_request, mut carry_body) or { break }
+		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur, first_request, mut
+			carry_body, rules) or { break }
 		first_request = false
 		if !keep_alive {
 			break
@@ -188,7 +208,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_auth string, req
 // 返回 true 表示客户端连接可复用；false 或 error 表示连接关闭。
 // error 仅在读取失败 / 上游关闭时返回，不发送响应；首请求解析失败会先发 400。
 fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bool,
-	idle_dur time.Duration, first_request bool, mut carry_body []u8) !bool {
+	idle_dur time.Duration, first_request bool, mut carry_body []u8, rules policy.Rules) !bool {
 	header_bytes, mut pending_body := read_request_head(mut socket, carry_body) or {
 		if first_request {
 			send_simple_response(mut socket, '400 Bad Request', '${err}\n')
@@ -318,6 +338,18 @@ fn process_request(mut socket net.TcpConn, expected_auth string, require_auth bo
 		}
 		upstream_host = normalize_authority(upstream_host, default_http_port)
 		forwarded_first_line = '${method} ${request_path} ${version}'
+	}
+
+	// 目标域名黑白名单（issue #30）：拨号前判定，拒绝则 403 并关闭。
+	// upstream_host 形如 "host:port"，判定前剥掉端口（IPv6 边界情况保留原值）。
+	mut target_name := upstream_host
+	if h, _ := net.split_address(upstream_host) {
+		target_name = h
+	}
+	if !policy.target_allowed(target_name, rules.allow, rules.deny) {
+		eprintln('policy: target ${target_name} denied by rules')
+		send_simple_response(mut socket, '403 Forbidden', 'Target denied by proxy policy\n')
+		return error('close')
 	}
 
 	mut upstream := net.dial_tcp(upstream_host) or {

@@ -28,6 +28,18 @@ fn test_load_toml_config_valid() {
 	assert cfg.deny_rules == ['evil.test']
 }
 
+fn test_load_toml_config_client_rules() {
+	// issue #30：client_allow / client_deny 解析；缺省为空数组。
+	path := write_tmp_toml('client_rules',
+		'listen = "0.0.0.0:5777"\n\n[rules]\nclient_allow = ["192.168.0.0/16"]\nclient_deny = ["192.168.1.5", "10.0.0.1"]\n')
+	defer {
+		os.rm(path) or {}
+	}
+	cfg := load_toml_config(path)!
+	assert cfg.client_allow == ['192.168.0.0/16']
+	assert cfg.client_deny == ['192.168.1.5', '10.0.0.1']
+}
+
 fn test_load_toml_config_missing_key_defaults() {
 	// 空文件：所有字段走默认（空字符串 / none / 空数组），不报错。
 	path := write_tmp_toml('empty', '')
@@ -41,6 +53,8 @@ fn test_load_toml_config_missing_key_defaults() {
 	assert cfg.idle_timeout_seconds == none
 	assert cfg.allow_rules.len == 0
 	assert cfg.deny_rules.len == 0
+	assert cfg.client_allow.len == 0
+	assert cfg.client_deny.len == 0
 }
 
 fn test_load_toml_config_type_error_with_line() {

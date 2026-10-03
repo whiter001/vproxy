@@ -61,6 +61,8 @@ idle_timeout_seconds = 300
 [rules]
 allow = ["*.example.com", "10.0.0.0/8"]
 deny  = ["evil.test"]
+client_allow = ["192.168.0.0/16"]
+client_deny  = ["192.168.1.5"]
 ```
 
 行为约定：
@@ -69,7 +71,21 @@ deny  = ["evil.test"]
 - **fail-fast**：语法错误、未知键、类型错误、非法取值（如 `log.level = "verbose"`）一律启动失败（退出码 1），错误信息含 `文件路径:行号`。行号通过「key → 行号」索引与语法错误渐进定位得到，定位不到时至少报文件路径，不谎报行号。
 - **类型校验**：V 标准库 `toml` 的 `.string()/.int()/.bool()` 在类型不匹配时会静默失真（如 int 的 `.string()` 返回 `Any(123)`），因此所有字段用 `match` 显式校验，坏配置不会「看起来成功」。
 - **打码**：启动日志打印生效配置（`--- Effective config ---`），`auth.password` 与 `auth_basic` 一律显示为 `******`。
-- `metrics_addr` 与 `[rules]` 当前只解析、校验并进入生效配置日志；metrics server 与域名过滤的运行时强制属于后续功能。
+- `metrics_addr` 当前只解析、校验并进入生效配置日志；metrics server 属于后续功能（issue #8）。
+- `[rules]` 黑白名单（issue #30）在运行时强制，规则形式与语义见下。
+
+### 访问控制规则（issue #30）
+
+四个键均为字符串数组，缺省为空表（不限制）：
+
+| 键 | 作用 | 拒绝语义 |
+| --- | --- | --- |
+| `allow` / `deny` | 目标侧（域名 / IP）黑白名单 | HTTP 403；SOCKS5 rep=2；SOCKS4 CD=0x5B |
+| `client_allow` / `client_deny` | 客户端 IP 黑白名单 | accept 后直接关闭连接（无响应） |
+
+规则形式：精确域名 `example.com`；通配 `*.example.com`（匹配根域与所有子域）；IPv4 CIDR `10.0.0.0/8`；裸 IPv4 精确匹配。
+
+判定语义：`allow` 非空时目标必须命中（白名单模式）；命中 `deny` 一律拒绝；两表皆空全放行。`client_*` 同理。
 
 ## 子命令
 

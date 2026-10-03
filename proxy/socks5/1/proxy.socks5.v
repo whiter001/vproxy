@@ -4,6 +4,7 @@ import io
 import lifecycle
 import net
 import os
+import policy
 import sync
 import sync.stdatomic
 import time
@@ -21,6 +22,7 @@ const socks5_atyp_ipv6 = u8(4)
 
 const socks5_rep_success = u8(0)
 const socks5_rep_server_failure = u8(1)
+const socks5_rep_not_allowed = u8(2)
 const socks5_rep_connection_refused = u8(5)
 const socks5_rep_command_not_supported = u8(7)
 const socks5_rep_address_not_supported = u8(8)
@@ -76,7 +78,17 @@ fn main() {
 		idle_timeout: cfg.idle_timeout
 		allow_rules:  cfg.allow_rules
 		deny_rules:   cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
 	})
+
+	// 策略配置（issue #30）：目标黑白名单 + 客户端 IP 黑白名单
+	rules := policy.Rules{
+		allow:        cfg.allow_rules
+		deny:         cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
+	}
 
 	lifecycle.install_signal_handlers()
 	idle_dur := cfg.idle_timeout
@@ -112,7 +124,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass)
+		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass, rules)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -124,7 +136,7 @@ fn main() {
 }
 
 fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, expected_user string,
-	expected_pass string) {
+	expected_pass string, rules policy.Rules) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -137,11 +149,18 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, e
 		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
+	// 客户端 IP 黑白名单（issue #30）
+	peer := policy.peer_ip(socket) or { '' }
+	if !policy.client_allowed(peer, rules.client_allow, rules.client_deny) {
+		eprintln('policy: client ${peer} denied by client rules')
+		return
+	}
+
 	if !handle_greeting_and_auth(mut socket, expected_user, expected_pass) {
 		return
 	}
 
-	handle_request(mut socket, idle_dur)
+	handle_request(mut socket, idle_dur, rules)
 }
 
 fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
@@ -232,7 +251,7 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 	return false
 }
 
-fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
+fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.Rules) {
 	mut header := []u8{len: 4}
 	read_exact(mut socket, mut header) or {
 		eprintln('Failed to read request header: ${err}')
@@ -322,7 +341,7 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 
 	match cmd {
 		socks5_cmd_connect {
-			handle_connect(mut socket, target_host, target_port, atyp, idle_dur)
+			handle_connect(mut socket, target_host, target_port, atyp, idle_dur, rules)
 		}
 		else {
 			// BIND / UDP ASSOCIATE 当前未实现（README 已说明）。
@@ -335,8 +354,15 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration) {
 // - issue #3：用 dial_addr 拼装 host:port（IPv6 加方括号）
 // - issue #3：send_reply 用 atyp 输出对应长度（10/22/7+N）
 // - issue #5：upstream 应用 idle timeout
+// - issue #30：拨号前做目标黑白名单判定，拒绝回 rep=2（not allowed by ruleset）
 fn handle_connect(mut socket net.TcpConn, target_host string, target_port u16, atyp u8,
-	idle_dur time.Duration) {
+	idle_dur time.Duration, rules policy.Rules) {
+	if !policy.target_allowed(target_host, rules.allow, rules.deny) {
+		eprintln('policy: target ${target_host} denied by rules')
+		send_reply(mut socket, socks5_rep_not_allowed, atyp, 0)
+		return
+	}
+
 	addr_str := dial_addr(target_host, target_port, atyp)
 	mut upstream := net.dial_tcp(addr_str) or {
 		eprintln('Failed to connect to ${addr_str}: ${err}')

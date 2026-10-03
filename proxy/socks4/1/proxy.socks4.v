@@ -4,6 +4,7 @@ import io
 import lifecycle
 import net
 import os
+import policy
 import sync
 import sync.stdatomic
 import time
@@ -58,7 +59,17 @@ fn main() {
 		idle_timeout: cfg.idle_timeout
 		allow_rules:  cfg.allow_rules
 		deny_rules:   cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
 	})
+
+	// 策略配置（issue #30）：目标黑白名单 + 客户端 IP 黑白名单
+	rules := policy.Rules{
+		allow:        cfg.allow_rules
+		deny:         cfg.deny_rules
+		client_allow: cfg.client_allow
+		client_deny:  cfg.client_deny
+	}
 
 	lifecycle.install_signal_handlers()
 	idle_dur := cfg.idle_timeout
@@ -95,7 +106,7 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, expected_user, skip_auth, idle_dur)
+		go handle_client(mut socket, stats, expected_user, skip_auth, idle_dur, rules)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -112,8 +123,9 @@ fn main() {
 // 2. USERID 校验（--no-auth 或期望 USERID 为空时跳过）
 // 3. 上游 dial + 双向 io.cp 中继（issue #5：idle timeout 应用到客户端与上游）
 // 4. SIGTERM drain 通过 inflight WaitGroup 完成
+// 5. issue #30：客户端 IP 与目标黑白名单判定（目标拒绝回 0x5B rejected）
 fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, skip_auth bool,
-	idle_dur time.Duration) {
+	idle_dur time.Duration, rules policy.Rules) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -124,6 +136,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, ski
 	defer {
 		duration := time.since(start)
 		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+	}
+
+	// 客户端 IP 黑白名单（issue #30）
+	peer := policy.peer_ip(socket) or { '' }
+	if !policy.client_allowed(peer, rules.client_allow, rules.client_deny) {
+		eprintln('policy: client ${peer} denied by client rules')
+		return
 	}
 
 	request := parse_request(mut socket) or {
@@ -137,6 +156,13 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, ski
 	// - expected_user 空：接受任意 USERID（与 SOCKS5 行为一致）
 	if !skip_auth && expected_user != '' && request.userid != expected_user {
 		eprintln('USERID mismatch: got "${request.userid}", expected "${expected_user}"')
+		send_reply(mut socket, socks4_cd_rejected, request.port, request.dst_ip_bytes)
+		return
+	}
+
+	// 目标黑白名单（issue #30）：拒绝语义与 USERID 校验一致（0x5B rejected）
+	if !policy.target_allowed(request.target_host, rules.allow, rules.deny) {
+		eprintln('policy: target ${request.target_host} denied by rules')
 		send_reply(mut socket, socks4_cd_rejected, request.port, request.dst_ip_bytes)
 		return
 	}
