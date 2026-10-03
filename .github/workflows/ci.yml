@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        proxy: [http, socks5, socks4, mproxy-serve, mproxy-client, mproxy-server]
+        proxy: [http, socks5, socks4, mproxy-serve, mproxy-client, mproxy-server, sps]
         target: [linux-x86_64, darwin-x86_64, darwin-arm64, windows-x86_64]
         include:
           - proxy: http
@@ -53,6 +53,8 @@ jobs:
             src: proxy/mproxy/1/mproxy.client.v
           - proxy: mproxy-server
             src: proxy/mproxy/1/mproxy.server.v
+          - proxy: sps
+            src: proxy/sps/1/proxy.sps.v
           - target: windows-x86_64
             os: windows-latest
             bin_ext: .exe
@@ -157,6 +159,7 @@ jobs:
           bash proxy/policy/test_policy.sh
           bash proxy/upstream/test_upstream.sh
           bash proxy/socks5/1/test_udp_associate.sh
+          bash proxy/sps/1/test_sps.sh
 
   release:
     runs-on: ubuntu-latest

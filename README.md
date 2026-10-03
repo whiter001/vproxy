@@ -68,6 +68,7 @@ curl -x http://127.0.0.1:5777 http://httpbin.org/ip
 | SOCKS5 | [`proxy/socks5/1/proxy.socks5.v`](proxy/socks5/1/proxy.socks5.v) | `:5778` |
 | SOCKS4 / SOCKS4a | [`proxy/socks4/1/proxy.socks4.v`](proxy/socks4/1/proxy.socks4.v) | `:5779` |
 | mproxy（XOR 隧道，**非真加密**） | [`proxy/mproxy/1/mproxy.serve.v`](proxy/mproxy/1/mproxy.serve.v) | `:8080` |
+| SPS（单端口多协议，HTTP+SOCKS5 首字节识别） | [`proxy/sps/1/proxy.sps.v`](proxy/sps/1/proxy.sps.v) | `:5780` |
 
 ## 作为 V 模块安装（VPM）
 

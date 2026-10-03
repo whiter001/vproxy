@@ -73,6 +73,27 @@
 - **没有 handshake / 口令字段**：客户端发完请求即收 reply；USERID 仅是标识字段。
 - reply 固定 8 字节（VN + CD + DSTPORT + DSTIP），VN 为 0x00。
 
+## SPS 协议嗅探（`proxy/sps/1/proxy.sps.v`，issue #29）
+
+SPS 在**同一个监听口**上同时服务 HTTP 代理与 SOCKS5 代理：accept 后只预读**首字节**，
+按其值判定协议，再把连接连同预读字节交给对应模块（`httpsrv` / `socks5srv`）：
+
+| 首字节 | 判定 | 行为 |
+| --- | --- | --- |
+| `0x05` | SOCKS5（RFC 1928 的 VER 字节） | 续读 NMETHODS/METHODS 进入标准 SOCKS5 流程，预读的 VER 不要求客户端重发 |
+| `A`-`Z`（大写 ASCII） | HTTP 代理（请求方法首字母） | 预读字节作为请求头初始缓冲进入 HTTP 流程（含 CONNECT / WebSocket） |
+| 其他（含 `0x00`-`0x04`、小写字母、EOF / 读超时） | 未识别 | 记日志后直接关闭连接，不发送任何协议应答；服务与其他连接不受影响 |
+
+识别规则说明：
+
+- SOCKS4 首字节为 `0x04`、Shadowsocks 等协议不在识别范围内，一律按未识别拒绝（不做 SS/SOCKS4 分流）。
+- HTTP 方法按 RFC 7231 均为大写，故大写 `A`-`Z` 首字母是安全判据；小写方法的非标客户端会被拒绝。
+- 首字节读取受 `--idle-timeout` 约束：客户端连上后不发送数据，超时后连接被回收。
+- 两个协议栈共用同一套 `policy.Rules`（issue #30）与 `--parent` 级联（issue #27）；
+  HTTP 侧凭据（`PROXY_AUTH_*` / `--http-*`）与 SOCKS5 侧凭据（`SOCKS5_AUTH_*` / `--socks5-*`）
+  相互独立，鉴权语义分别与 http / socks5 代理一致。
+- 预读字节不丢失：SOCKS5 路径经 `ver_already_read` 传入，HTTP 路径经 `preface` 回灌给请求头解析器。
+
 ## 访问控制（issue #30）
 
 三个代理共用同一套黑白名单（`proxy/policy`），经 `proxy.toml` 的 `[rules]` 配置：
@@ -117,6 +138,7 @@ bash proxy/vpcli/test_cli.sh            # CLI 参数解析
 bash proxy/policy/test_policy.sh        # 黑白名单运行时强制（issue #30）
 bash proxy/upstream/test_upstream.sh    # 上级代理级联（issue #27）
 bash proxy/socks5/1/test_udp_associate.sh # UDP ASSOCIATE（issue #26）
+bash proxy/sps/1/test_sps.sh            # SPS 单端口多协议嗅探（issue #29）
 ```
 
 真网端到端（依赖 httpbin.org，不可达时跳过）：
