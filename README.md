@@ -41,8 +41,28 @@ flowchart LR
 
 ### Docker
 
-仓库当前未提供 Dockerfile 或公开发布的容器镜像。请先按下方「本地构建运行」编译二进制，
-再自行制作镜像；不要依赖未由本仓库发布流程生成的 `ghcr.io/whiter001/vproxy` 镜像。
+仓库根提供 [Dockerfile](Dockerfile)：多阶段构建——debian builder 内以预编译 V 0.5.2 编译
+`-prod` 二进制，`debian:bookworm-slim` 运行层（musl 全静态因 V vendored libgc 依赖 getcontext 不可用），
+内含 `proxy.http` / `proxy.socks5` / `proxy.socks4` 三个二进制，默认 entrypoint 为 HTTP 代理：
+
+```bash
+# 构建
+docker build -t vproxy:latest .
+
+# 运行（HTTP 代理，默认监听 :5777）
+docker run --rm -e PROXY_REQUIRE_AUTH=0 -p 5777:5777 vproxy:latest
+
+# 切换其他代理（以 SOCKS5 为例）
+docker run --rm -e PROXY_REQUIRE_AUTH=0 -p 5778:5778 \
+  --entrypoint /usr/local/bin/proxy.socks5 vproxy:latest
+
+# 鉴权经环境变量传入：
+#   HTTP   PROXY_AUTH_USER / PROXY_AUTH_PASS
+#   SOCKS5 SOCKS5_AUTH_USERNAME / SOCKS5_AUTH_PASSWORD
+```
+
+仓库仍未发布预构建容器镜像，需按上述命令自行构建（也可用 `docker buildx bake`，配置见
+[docker-bake.hcl](docker-bake.hcl)）。
 
 ### 本地构建运行
 
