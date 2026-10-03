@@ -17,6 +17,7 @@ const socks5_auth_userpass = u8(2)
 const socks5_auth_no_acceptable = u8(0xff)
 
 const socks5_cmd_connect = u8(1)
+const socks5_cmd_udp_associate = u8(3)
 const socks5_atyp_ipv4 = u8(1)
 const socks5_atyp_domain = u8(3)
 const socks5_atyp_ipv6 = u8(4)
@@ -117,6 +118,10 @@ fn main() {
 
 	eprintln('SOCKS5 proxy listening on ${listen_addr} (idle_timeout=${idle_dur}) ...')
 
+	// UDP ASSOCIATE（issue #26）的 relay 绑定地址与 TCP 监听同 host；
+	// listen 非法时 vpcli 已 fail-fast。IPv6 保留方括号（[::]:0 为规范形式）。
+	relay_host := listen_addr.all_before_last(':')
+
 	stats := &Stats{}
 	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
 	server.set_accept_timeout(1 * time.second)
@@ -138,7 +143,8 @@ fn main() {
 		}
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
-		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass, rules, parent)
+		go handle_client(mut socket, stats, idle_dur, expected_user, expected_pass, rules,
+			parent, relay_host)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -150,7 +156,7 @@ fn main() {
 }
 
 fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, expected_user string,
-	expected_pass string, rules policy.Rules, parent ?upx.Parent) {
+	expected_pass string, rules policy.Rules, parent ?upx.Parent, relay_host string) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -174,7 +180,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, e
 		return
 	}
 
-	handle_request(mut socket, idle_dur, rules, parent)
+	handle_request(mut socket, idle_dur, rules, parent, relay_host)
 }
 
 fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string) bool {
@@ -265,7 +271,7 @@ fn handle_userpass_auth(mut socket net.TcpConn, expected_user string, expected_p
 	return false
 }
 
-fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent) {
+fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent, relay_host string) {
 	mut header := []u8{len: 4}
 	read_exact(mut socket, mut header) or {
 		eprintln('Failed to read request header: ${err}')
@@ -357,8 +363,13 @@ fn handle_request(mut socket net.TcpConn, idle_dur time.Duration, rules policy.R
 		socks5_cmd_connect {
 			handle_connect(mut socket, target_host, target_port, atyp, idle_dur, rules, parent)
 		}
+		socks5_cmd_udp_associate {
+			// 请求的 DST.ADDR/DST.PORT 按 RFC 1928 §4.3 仅是客户端「预期」
+			// 发送 UDP 的地址提示（常为 0.0.0.0:0），relay 按实际源地址工作。
+			handle_udp_associate(mut socket, atyp, relay_host, rules)
+		}
 		else {
-			// BIND / UDP ASSOCIATE 当前未实现（README 已说明）。
+			// BIND 当前未实现（docs/PROTOCOL.md 已说明）。
 			send_reply(mut socket, socks5_rep_command_not_supported, atyp, 0)
 		}
 	}
@@ -472,5 +483,206 @@ fn read_exact(mut socket net.TcpConn, mut buf []u8) ! {
 			return error('unexpected EOF')
 		}
 		total += n
+	}
+}
+
+// 块作用：UDP ASSOCIATE（RFC 1928 §4.3，issue #26）
+// 处理问题：
+// - 在与 TCP 监听同 host 的地址上绑定 UDP relay（临时端口），reply 带回 BND.PORT；
+// - 客户端 → relay 的数据报按 RFC 1928 UDP 封装头（RSV(2) FRAG(1) ATYP DST.PORT）
+//   解封后转发到目标；目标 → relay 的数据报按客户端当初使用的 ATYP 形式封装回传；
+// - TCP 控制连接断开（含 idle 超时）即回收 relay：watcher 置 done，主循环靠
+//   1s 读超时轮询退出（close UDP socket 无法可靠唤醒阻塞中的 recvfrom，跨平台）。
+// 明确边界：
+// - FRAG≠0 丢弃（不支持分片重组，RFC 允许 MUST drop）；
+// - 非客户端源的首个数据报丢弃：客户端 = TCP 对端 IP 匹配的首个 UDP 源；
+// - 未在映射表中的外源数据报丢弃（relay 只对「客户端先发过」的目标回传）；
+// - 目标域名每个数据报都重新 resolve（v1 不做 DNS 缓存）；
+// - 目标 family 与 relay socket 不一致时丢弃（如 IPv4 relay 到不了 IPv6 目标）；
+// - relay 生命周期受 --idle-timeout 约束（控制连接无数据即 idle），长会话置 0；
+// - 级联（--parent，issue #27）不适用于 UDP：上级为 socks5 时亦不穿透 UDP。
+fn handle_udp_associate(mut socket net.TcpConn, req_atyp u8, relay_host string, rules policy.Rules) {
+	mut udp := net.listen_udp('${relay_host}:0') or {
+		eprintln('udp associate: listen failed: ${err}')
+		send_reply(mut socket, socks5_rep_server_failure, req_atyp, 0)
+		return
+	}
+	defer {
+		udp.close() or {}
+	}
+
+	local := net.addr_from_socket_handle(udp.sock.handle)
+	local_port := local.port() or { 0 }
+	relay_family := local.family()
+	// BND.ADDR 惯例回全 0（客户端用 TCP 同一目标地址即可），ATYP 与 relay family 一致
+	reply_atyp := if relay_family == .ip6 { socks5_atyp_ipv6 } else { socks5_atyp_ipv4 }
+	send_reply(mut socket, socks5_rep_success, reply_atyp, local_port)
+	eprintln('udp associate: relay on ${local}')
+
+	// 控制连接监视：读到 EOF / 错误（含 idle 超时）即结束关联。
+	// 控制连接按 RFC 不承载数据，读到的垃圾字节直接忽略。
+	mut done := i64(0)
+	mut wg := sync.new_waitgroup()
+	wg.add(1)
+	go fn (mut socket net.TcpConn, mut wg sync.WaitGroup, done &i64) {
+		defer {
+			wg.done()
+		}
+		mut one := []u8{len: 1}
+		for {
+			socket.read(mut one) or { break }
+		}
+		stdatomic.store_i64(done, 1)
+	}(mut socket, mut wg, &done)
+
+	udp.set_read_timeout(1 * time.second)
+	peer := policy.peer_ip(socket) or { '' }
+	mut client := ?net.Addr(none)
+	mut headers := map[string][]u8{}
+	mut buf := []u8{len: 65535}
+	for stdatomic.load_i64(&done) == 0 {
+		n, src := udp.read(mut buf) or {
+			if err.msg().contains('timed out') {
+				continue
+			}
+			eprintln('udp associate: relay read error: ${err}')
+			break
+		}
+		if n <= 0 {
+			continue
+		}
+		data := unsafe { buf[..n] } // 同步处理完毕才读下一报文，无需拷贝
+		if c := client {
+			if src.str() == c.str() {
+				udp_forward_to_target(mut udp, data, mut headers, relay_family, rules)
+			} else {
+				// 目标 → 客户端：只回传「客户端先联系过」的目标，其余外源一律丢弃
+				prefix := headers[src.str()] or { continue }
+				mut out := []u8{cap: prefix.len + data.len}
+				out << prefix
+				out << data
+				udp.write_to(c, out) or {
+					eprintln('udp associate: write to client failed: ${err}')
+				}
+			}
+		} else {
+			// 首报文定客户端：源 IP 必须等于 TCP 控制连接对端 IP，
+			// 防止本机其他进程抢注关联
+			src_host, _ := net.split_address(src.str()) or { continue }
+			if peer != '' && src_host == peer {
+				client = src
+				udp_forward_to_target(mut udp, data, mut headers, relay_family, rules)
+			}
+		}
+	}
+
+	// 唤醒 watcher（shutdown read → read 返回 EOF），等其退出后再返回，
+	// 避免 watcher 的 read 与 handle_client defer 的 close 竞争同一 socket
+	net.shutdown(socket.sock.handle, how: .read)
+	wg.wait()
+	eprintln('udp associate: relay closed')
+}
+
+// 客户端 → 目标：解封 RFC 1928 UDP 请求头并转发
+fn udp_forward_to_target(mut udp net.UdpConn, data []u8, mut headers map[string][]u8,
+	relay_family net.AddrFamily, rules policy.Rules) {
+	if data.len < 4 {
+		return
+	}
+	if data[0] != 0 || data[1] != 0 {
+		return // RSV 必须为 0
+	}
+	if data[2] != 0 {
+		return // FRAG≠0：不支持分片，按 RFC 丢弃
+	}
+	atyp := data[3]
+	mut off := 0
+	mut dst_host := ''
+	mut dst_port := u16(0)
+	match atyp {
+		socks5_atyp_ipv4 {
+			if data.len < 10 {
+				return
+			}
+			dst_host = data[4..8].map(it.str()).join('.')
+			dst_port = (u16(data[8]) << 8) | u16(data[9])
+			off = 10
+		}
+		socks5_atyp_domain {
+			dlen := int(data[4])
+			if data.len < 5 + dlen + 2 {
+				return
+			}
+			dst_host = data[5..5 + dlen].bytestr()
+			dst_port = (u16(data[5 + dlen]) << 8) | u16(data[6 + dlen])
+			off = 7 + dlen
+		}
+		socks5_atyp_ipv6 {
+			if data.len < 22 {
+				return
+			}
+			mut parts := []string{len: 8}
+			for i := 0; i < 8; i++ {
+				val := (u16(data[4 + i * 2]) << 8) | u16(data[5 + i * 2])
+				parts[i] = val.hex_full()
+			}
+			dst_host = parts.join(':')
+			dst_port = (u16(data[20]) << 8) | u16(data[21])
+			off = 22
+		}
+		else {
+			return
+		}
+	}
+
+	// 目标黑白名单（issue #30）：UDP 无错误应答，拒绝即静默丢弃
+	if !policy.target_allowed(dst_host, rules.allow, rules.deny) {
+		eprintln('policy: udp target ${dst_host} denied by rules')
+		return
+	}
+
+	// 解析目标 Addr；IPv4/IPv6 字面量直接构造，域名逐报文 resolve
+	mut dst_addr := net.Addr{}
+	if atyp == socks5_atyp_ipv4 {
+		mut ip4 := [4]u8{}
+		for i in 0 .. 4 {
+			ip4[i] = data[4 + i]
+		}
+		dst_addr = net.new_ip(dst_port, ip4)
+	} else if atyp == socks5_atyp_ipv6 {
+		mut ip6 := [16]u8{}
+		for i in 0 .. 16 {
+			ip6[i] = data[4 + i]
+		}
+		dst_addr = net.new_ip6(dst_port, ip6)
+	} else {
+		addrs := net.resolve_addrs_fuzzy('${dst_host}:${dst_port}', .udp) or {
+			eprintln('udp associate: resolve ${dst_host} failed: ${err}')
+			return
+		}
+		mut picked := false
+		for a in addrs {
+			if a.family() == relay_family {
+				dst_addr = a
+				picked = true
+				break
+			}
+		}
+		if !picked {
+			eprintln('udp associate: no ${relay_family} address for ${dst_host}')
+			return
+		}
+	}
+	if dst_addr.family() != relay_family {
+		eprintln('udp associate: target family mismatch, drop')
+		return
+	}
+
+	// 记录回传封装头（保留客户端使用的原 ATYP 形式）；map 上限防内存膨胀
+	if headers.len < 1024 {
+		headers[dst_addr.str()] = data[..off].clone()
+	}
+	udp.write_to(dst_addr, data[off..]) or {
+		eprintln('udp associate: write to ${dst_addr} failed: ${err}')
 	}
 }
