@@ -30,6 +30,8 @@ pub mut:
 	idle_timeout_seconds ?int // none 表示文件里没有显式设置该键
 	allow_rules          []string
 	deny_rules           []string
+	client_allow         []string
+	client_deny          []string
 }
 
 // 顶层允许的键；之外的键一律 fail-fast。
@@ -37,7 +39,7 @@ const top_level_keys = ['listen', 'auth', 'log', 'metrics_addr', 'idle_timeout_s
 
 const auth_keys = ['user', 'password']
 const log_keys = ['level', 'format']
-const rules_keys = ['allow', 'deny']
+const rules_keys = ['allow', 'deny', 'client_allow', 'client_deny']
 const valid_log_levels = ['debug', 'info', 'warn', 'error']
 const valid_log_formats = ['text', 'json']
 
@@ -109,6 +111,8 @@ pub fn load_toml_config(path string) !TomlConfig {
 	}
 	cfg.allow_rules = get_string_array_field(doc, 'rules.allow', path, index)!
 	cfg.deny_rules = get_string_array_field(doc, 'rules.deny', path, index)!
+	cfg.client_allow = get_string_array_field(doc, 'rules.client_allow', path, index)!
+	cfg.client_deny = get_string_array_field(doc, 'rules.client_deny', path, index)!
 
 	// idle_timeout_seconds：整数；缺省保持 none
 	if iv := doc.value_opt('idle_timeout_seconds') {
@@ -402,6 +406,8 @@ pub:
 	idle_timeout time.Duration
 	allow_rules  []string
 	deny_rules   []string
+	client_allow []string
+	client_deny  []string
 }
 
 // 打印生效配置（密码类字段一律打码）。
@@ -435,5 +441,11 @@ pub fn print_effective_config(cfg EffectiveConfig) {
 	}
 	if cfg.deny_rules.len > 0 {
 		eprintln('rules.deny = ${cfg.deny_rules}')
+	}
+	if cfg.client_allow.len > 0 {
+		eprintln('rules.client_allow = ${cfg.client_allow}')
+	}
+	if cfg.client_deny.len > 0 {
+		eprintln('rules.client_deny = ${cfg.client_deny}')
 	}
 }
