@@ -93,6 +93,32 @@ pub mut:
 	show_version bool
 }
 
+// SPS 单端口多协议代理配置（issue #29）：同一监听口按首字节识别 HTTP / SOCKS5。
+// http_* 与 s5_* 两套凭据互相独立，均遵循 CLI > env > file > default 优先级。
+pub struct SpsConfig {
+pub mut:
+	listen_addr       string
+	http_user         string
+	http_pass         string
+	http_basic        string
+	http_require_auth bool // false 表示关闭 HTTP 侧鉴权（--no-http-auth 或 PROXY_REQUIRE_AUTH=0）
+	s5_user           string
+	s5_pass           string
+	s5_no_auth        bool // --no-socks5-auth 或 SOCKS5_NO_AUTH=1；置位后覆盖 s5_user/s5_pass
+	idle_timeout      time.Duration
+	log_format        string
+	log_level         string
+	metrics_addr      string
+	allow_rules       []string
+	deny_rules        []string
+	client_allow      []string
+	client_deny       []string
+	parent            string // 上级代理 URL（issue #27）：http:// 或 socks5://，可带 user:pass@
+	config_file       string
+	show_help         bool
+	show_version      bool
+}
+
 // 块作用：解析 HTTP 代理命令行参数
 // 处理问题（issue #4）：
 // 1. 子命令分发：`serve`（默认）/ `--help` / `--version`
@@ -432,6 +458,185 @@ pub fn parse_socks4_args(args []string) !Socks4Config {
 	}
 }
 
+// 块作用：解析 SPS 单端口多协议代理命令行参数（issue #29）
+// 处理问题：HTTP 侧与 SOCKS5 侧各有一套凭据 flags/env，优先级规则与
+// parse_http_args / parse_socks5_args 完全一致（CLI > env > file > default）。
+// env 复用现有变量：HTTP 侧沿用 PROXY_AUTH_*（与 http 代理共享语义），
+// SOCKS5 侧沿用 SOCKS5_AUTH_*（与 socks5 代理共享语义），通用项新增 SPS_*。
+pub fn parse_sps_args(args []string) !SpsConfig {
+	rest, sub_error := strip_executable_and_subcommand(args)
+	if sub_error != '' {
+		return error(sub_error)
+	}
+
+	mut fp := flag.new_flag_parser(rest)
+	fp.application('vproxy sps serve')
+	fp.version(version)
+	fp.description('V-language single-port multi-protocol proxy (HTTP + SOCKS5, first-byte sniffing)')
+
+	listen := fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or {
+		''
+	}
+	http_user := fp.string_opt('http-user', 0, 'HTTP proxy username', flag.FlagConfig{
+		val_desc: 'name'
+	}) or { '' }
+	http_pass := fp.string_opt('http-pass', 0, 'HTTP proxy password', flag.FlagConfig{
+		val_desc: 'pwd'
+	}) or { '' }
+	http_basic := fp.string_opt('http-basic', 0, 'pre-encoded HTTP Basic credential (base64(user:pass))', flag.FlagConfig{
+		val_desc: 'b64'
+	}) or { '' }
+	no_http_auth := fp.bool_opt('no-http-auth', `n`, 'disable HTTP proxy authentication', flag.FlagConfig{}) or {
+		false
+	}
+	s5_user := fp.string_opt('socks5-user', 0, 'SOCKS5 username', flag.FlagConfig{
+		val_desc: 'name'
+	}) or { '' }
+	s5_pass := fp.string_opt('socks5-pass', 0, 'SOCKS5 password', flag.FlagConfig{
+		val_desc: 'pwd'
+	}) or { '' }
+	no_s5_auth := fp.bool_opt('no-socks5-auth', 0, 'disable SOCKS5 authentication', flag.FlagConfig{}) or {
+		false
+	}
+	config_file := fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
+		val_desc: 'path'
+	}) or { '' }
+	log_format := fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{
+		val_desc: 'fmt'
+	}) or { '' }
+	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
+		val_desc: 'lvl'
+	}) or { '' }
+	idle := fp.int_opt('idle-timeout', `i`, 'idle timeout in seconds (0 to disable)', flag.FlagConfig{
+		val_desc: 'sec'
+	}) or { -1 }
+	parent := fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
+	}) or { '' }
+	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
+	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
+		false
+	}
+
+	fp.finalize() or { return error(err.msg()) }
+
+	// 配置文件层：--config 显式指定 > CWD 下的 proxy.toml；--help/--version 不加载
+	file_cfg, resolved_cfg_path := load_file_layer(config_file, show_help || show_version)!
+
+	final_listen := if listen != '' {
+		listen
+	} else if os.getenv_opt('SPS_LISTEN_ADDR') or { '' } != '' {
+		os.getenv_opt('SPS_LISTEN_ADDR') or { '' }
+	} else if file_cfg.listen_addr != '' {
+		file_cfg.listen_addr
+	} else {
+		':5780'
+	}
+	final_http_user := if http_user != '' {
+		http_user
+	} else if os.getenv_opt('PROXY_AUTH_USER') or { '' } != '' {
+		os.getenv_opt('PROXY_AUTH_USER') or { '' }
+	} else {
+		file_cfg.auth_user
+	}
+	final_http_pass := if http_pass != '' {
+		http_pass
+	} else if os.getenv_opt('PROXY_AUTH_PASS') or { '' } != '' {
+		os.getenv_opt('PROXY_AUTH_PASS') or { '' }
+	} else {
+		file_cfg.auth_pass
+	}
+	final_http_basic := if http_basic != '' {
+		http_basic
+	} else {
+		os.getenv_opt('PROXY_AUTH_BASIC') or { '' }
+	}
+	final_s5_user := if s5_user != '' {
+		s5_user
+	} else if os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' } != '' {
+		os.getenv_opt('SOCKS5_AUTH_USERNAME') or { '' }
+	} else {
+		file_cfg.auth_user
+	}
+	final_s5_pass := if s5_pass != '' {
+		s5_pass
+	} else if os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' } != '' {
+		os.getenv_opt('SOCKS5_AUTH_PASSWORD') or { '' }
+	} else {
+		file_cfg.auth_pass
+	}
+	final_log_format := if log_format != '' {
+		log_format
+	} else if file_cfg.log_format != '' {
+		file_cfg.log_format
+	} else {
+		'text'
+	}
+	final_log_level := if log_level != '' {
+		log_level
+	} else if file_cfg.log_level != '' {
+		file_cfg.log_level
+	} else {
+		'info'
+	}
+
+	mut final_http_require_auth := true
+	if no_http_auth {
+		final_http_require_auth = false
+	} else if os.getenv_opt('PROXY_REQUIRE_AUTH') or { '' } == '0' {
+		final_http_require_auth = false
+	}
+
+	mut final_s5_no_auth := false
+	if no_s5_auth {
+		final_s5_no_auth = true
+	} else if os.getenv_opt('SOCKS5_NO_AUTH') or { '' } == '1' {
+		final_s5_no_auth = true
+	}
+
+	// idle timeout：CLI > env(SPS_IDLE_TIMEOUT) > file > default；0 / 负值 = 禁用
+	final_idle := if idle >= 0 {
+		if idle == 0 {
+			time.infinite
+		} else {
+			time.Duration(idle) * time.second
+		}
+	} else {
+		parse_idle_timeout_merged('SPS_IDLE_TIMEOUT', file_cfg.idle_timeout_seconds, 300)
+	}
+
+	final_parent := if parent != '' {
+		parent
+	} else if os.getenv_opt('SPS_PARENT') or { '' } != '' {
+		os.getenv_opt('SPS_PARENT') or { '' }
+	} else {
+		file_cfg.parent
+	}
+
+	return SpsConfig{
+		listen_addr:       final_listen
+		http_user:         final_http_user
+		http_pass:         final_http_pass
+		http_basic:        final_http_basic
+		http_require_auth: final_http_require_auth
+		s5_user:           final_s5_user
+		s5_pass:           final_s5_pass
+		s5_no_auth:        final_s5_no_auth
+		idle_timeout:      final_idle
+		log_format:        final_log_format
+		log_level:         final_log_level
+		metrics_addr:      file_cfg.metrics_addr
+		allow_rules:       file_cfg.allow_rules
+		deny_rules:        file_cfg.deny_rules
+		client_allow:      file_cfg.client_allow
+		client_deny:       file_cfg.client_deny
+		parent:            final_parent
+		config_file:       resolved_cfg_path
+		show_help:         show_help
+		show_version:      show_version
+	}
+}
+
 // 块作用：剥离 os.args 的 exe 路径和子命令
 // 处理问题：flag.FlagParser 默认假设 args[0] 是 exe，不能再调 skip_executable()。
 // 我们手动 strip 掉 exe + 可能的子命令（`serve`），剩下的就是纯 flag 数组。
@@ -555,6 +760,54 @@ pub fn print_socks4_help() {
 	}
 	fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
+	}) or { '' }
+	fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
+	fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }
+	fp.finalize() or {}
+	println(fp.usage())
+}
+
+pub fn print_sps_help() {
+	mut fp := flag.new_flag_parser([]string{})
+	fp.application('vproxy sps serve')
+	fp.version(version)
+	fp.description('V-language single-port multi-protocol proxy (HTTP + SOCKS5, first-byte sniffing)')
+	fp.string_opt('listen', `l`, 'listen address', flag.FlagConfig{ val_desc: 'addr' }) or { '' }
+	fp.string_opt('http-user', 0, 'HTTP proxy username', flag.FlagConfig{ val_desc: 'name' }) or {
+		''
+	}
+	fp.string_opt('http-pass', 0, 'HTTP proxy password', flag.FlagConfig{ val_desc: 'pwd' }) or {
+		''
+	}
+	fp.string_opt('http-basic', 0, 'pre-encoded HTTP Basic credential (base64(user:pass))', flag.FlagConfig{
+		val_desc: 'b64'
+	}) or { '' }
+	fp.bool_opt('no-http-auth', `n`, 'disable HTTP proxy authentication', flag.FlagConfig{}) or {
+		false
+	}
+	fp.string_opt('socks5-user', 0, 'SOCKS5 username', flag.FlagConfig{ val_desc: 'name' }) or {
+		''
+	}
+	fp.string_opt('socks5-pass', 0, 'SOCKS5 password', flag.FlagConfig{ val_desc: 'pwd' }) or {
+		''
+	}
+	fp.bool_opt('no-socks5-auth', 0, 'disable SOCKS5 authentication', flag.FlagConfig{}) or {
+		false
+	}
+	fp.string_opt('config', `c`, 'config file (TOML)', flag.FlagConfig{
+		val_desc: 'path'
+	}) or { '' }
+	fp.string_opt('log-format', `f`, 'log format: text|json', flag.FlagConfig{ val_desc: 'fmt' }) or {
+		''
+	}
+	fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
+		val_desc: 'lvl'
+	}) or { '' }
+	fp.int_opt('idle-timeout', `i`, 'idle timeout in seconds (0 to disable)', flag.FlagConfig{
+		val_desc: 'sec'
+	}) or { -1 }
+	fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
 	}) or { '' }
 	fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }

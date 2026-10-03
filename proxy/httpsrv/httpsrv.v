@@ -18,7 +18,9 @@ const default_http_port = ':80'
 const default_https_port = ':443'
 
 pub struct Stats {
-mut:
+pub mut:
+	// pub mut 而非 mut（issue #29）：sps 单端口多协议入口在自己的 accept 循环里
+	// 做计数与 inflight.add(1)，退出时 drain 两个协议栈的 Stats，必须能跨模块访问。
 	active_conns i64
 	inflight     sync.WaitGroup // 跟踪在飞连接，用于优雅退出（issue #5）
 }
