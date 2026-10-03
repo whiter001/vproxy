@@ -107,7 +107,7 @@ jobs:
       - name: Run V unit tests
         shell: bash
         run: |
-          v test proxy/http/1 proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle proxy/vpcli proxy/policy
+          v test proxy/http/1 proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle proxy/vpcli proxy/policy proxy/upstream
 
       # 本地全量测试（无外网依赖）：
       # - HTTP：鉴权 407 / 头部清理 / Chunked / CONNECT 隧道 / HEAD / 畸形请求 / half-close
@@ -155,6 +155,7 @@ jobs:
           bash proxy/mproxy/1/test_tunnel.sh
           bash proxy/mproxy/1/test_socks5_upstream.sh
           bash proxy/policy/test_policy.sh
+          bash proxy/upstream/test_upstream.sh
 
   release:
     runs-on: ubuntu-latest

@@ -45,6 +45,7 @@ pub mut:
 	deny_rules   []string
 	client_allow []string
 	client_deny  []string
+	parent       string // 上级代理 URL（issue #27）：http:// 或 socks5://，可带 user:pass@
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -65,6 +66,7 @@ pub mut:
 	deny_rules   []string
 	client_allow []string
 	client_deny  []string
+	parent       string // 上级代理 URL（issue #27）：http:// 或 socks5://，可带 user:pass@
 	config_file  string
 	show_help    bool
 	show_version bool
@@ -125,6 +127,9 @@ pub fn parse_http_args(args []string) !HttpConfig {
 	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
 	}) or { '' }
+	parent := fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
+	}) or { '' }
 	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
 		false
@@ -184,6 +189,14 @@ pub fn parse_http_args(args []string) !HttpConfig {
 		require_auth = false
 	}
 
+	final_parent := if parent != '' {
+		parent
+	} else if os.getenv_opt('PROXY_PARENT') or { '' } != '' {
+		os.getenv_opt('PROXY_PARENT') or { '' }
+	} else {
+		file_cfg.parent
+	}
+
 	return HttpConfig{
 		listen_addr:  final_listen
 		auth_user:    final_user
@@ -199,6 +212,7 @@ pub fn parse_http_args(args []string) !HttpConfig {
 		deny_rules:   file_cfg.deny_rules
 		client_allow: file_cfg.client_allow
 		client_deny:  file_cfg.client_deny
+		parent:       final_parent
 		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
@@ -231,6 +245,9 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 	}) or { '' }
 	log_level := fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
+	}) or { '' }
+	parent := fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
 	}) or { '' }
 	show_help := fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	show_version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or {
@@ -287,6 +304,14 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 		final_no_auth = true
 	}
 
+	final_parent := if parent != '' {
+		parent
+	} else if os.getenv_opt('SOCKS5_PARENT') or { '' } != '' {
+		os.getenv_opt('SOCKS5_PARENT') or { '' }
+	} else {
+		file_cfg.parent
+	}
+
 	return Socks5Config{
 		listen_addr:  final_listen
 		auth_user:    final_user
@@ -301,6 +326,7 @@ pub fn parse_socks5_args(args []string) !Socks5Config {
 		deny_rules:   file_cfg.deny_rules
 		client_allow: file_cfg.client_allow
 		client_deny:  file_cfg.client_deny
+		parent:       final_parent
 		config_file:  resolved_cfg_path
 		show_help:    show_help
 		show_version: show_version
@@ -475,6 +501,9 @@ pub fn print_http_help() {
 	fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
 	}) or { '' }
+	fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
+	}) or { '' }
 	fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }
 	fp.finalize() or {}
@@ -498,6 +527,9 @@ pub fn print_socks5_help() {
 	}
 	fp.string_opt('log-level', 0, 'log level: debug|info|warn|error', flag.FlagConfig{
 		val_desc: 'lvl'
+	}) or { '' }
+	fp.string_opt('parent', 0, 'upstream parent proxy: http://[user:pass@]host:port or socks5://[user:pass@]host:port', flag.FlagConfig{
+		val_desc: 'url'
 	}) or { '' }
 	fp.bool_opt('help', `h`, 'show help and exit', flag.FlagConfig{}) or { false }
 	fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }

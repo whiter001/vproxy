@@ -75,6 +75,20 @@
 规则形式：精确域名、`*.example.com` 通配（含根域）、IPv4 CIDR、裸 IPv4。
 语义：allow 非空 = 白名单（必须命中）；deny 命中即拒；两表皆空 = 全放行。
 
+## 上级代理级联（issue #27）
+
+HTTP 与 SOCKS5 代理支持 `--parent` / `PROXY_PARENT` / `SOCKS5_PARENT` / TOML `parent` 键把全部流量转发到上级（配置即强制走上级）：
+
+| 上级 scheme | HTTP 代理行为 | SOCKS5 代理行为 |
+| --- | --- | --- |
+| `http://[user:pass@]host:port` | CONNECT 走 RFC 7231 隧道；明文 / WebSocket 改发 absolute-form 请求行 | 经上级 CONNECT 隧道转发 |
+| `socks5://[user:pass@]host:port` | 经上级 RFC 1928 CONNECT 转发 | 同左（复用 `mproxy/socks5_dial`） |
+
+- 上级认证：URL 内嵌 `user:pass@`（HTTP 上级注入 `Proxy-Authorization`，SOCKS5 上级走 RFC 1929）。
+- 失败语义：上级不可达 → HTTP `502` / SOCKS5 `rep=5`；HTTP 上级对明文转发的 407 等响应按原语义透传给客户端。
+- 级联 TLS（`https://` 上级）当前不支持：relay 层基于 `net.TcpConn` 具体类型与半关闭传播，接入 SSL 需要单独重构，见 issue #27 讨论。
+- SOCKS4 不支持上级代理。
+
 ## 验证方式
 
 本地脚本（无外网依赖）验证上述行为：
@@ -91,6 +105,7 @@ bash proxy/socks4/1/test_protocol.sh    # SOCKS4/4a 协议合规
 bash proxy/lifecycle/test_lifecycle.sh  # 优雅退出 / idle timeout
 bash proxy/vpcli/test_cli.sh            # CLI 参数解析
 bash proxy/policy/test_policy.sh        # 黑白名单运行时强制（issue #30）
+bash proxy/upstream/test_upstream.sh    # 上级代理级联（issue #27）
 ```
 
 真网端到端（依赖 httpbin.org，不可达时跳过）：

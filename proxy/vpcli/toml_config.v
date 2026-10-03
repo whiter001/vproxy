@@ -32,10 +32,12 @@ pub mut:
 	deny_rules           []string
 	client_allow         []string
 	client_deny          []string
+	parent               string
 }
 
 // 顶层允许的键；之外的键一律 fail-fast。
-const top_level_keys = ['listen', 'auth', 'log', 'metrics_addr', 'idle_timeout_seconds', 'rules']
+const top_level_keys = ['listen', 'auth', 'log', 'metrics_addr', 'idle_timeout_seconds', 'rules',
+	'parent']
 
 const auth_keys = ['user', 'password']
 const log_keys = ['level', 'format']
@@ -73,6 +75,7 @@ pub fn load_toml_config(path string) !TomlConfig {
 	mut cfg := TomlConfig{}
 	cfg.listen_addr = get_string_field(doc, 'listen', path, index)!
 	cfg.metrics_addr = get_string_field(doc, 'metrics_addr', path, index)!
+	cfg.parent = get_string_field(doc, 'parent', path, index)!
 
 	// auth 表（table_value 对「键存在但类型不是表」返回 error，用 or 传播保证 fail-fast）
 	auth_tbl := table_value(doc, 'auth', path, index) or { return err }
@@ -408,6 +411,7 @@ pub:
 	deny_rules   []string
 	client_allow []string
 	client_deny  []string
+	parent       string
 }
 
 // 打印生效配置（密码类字段一律打码）。
@@ -447,5 +451,8 @@ pub fn print_effective_config(cfg EffectiveConfig) {
 	}
 	if cfg.client_deny.len > 0 {
 		eprintln('rules.client_deny = ${cfg.client_deny}')
+	}
+	if cfg.parent != '' {
+		eprintln('parent = ${cfg.parent}')
 	}
 }

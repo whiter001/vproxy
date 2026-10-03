@@ -17,7 +17,7 @@
 
 ## 支持的选项
 
-HTTP、SOCKS5、SOCKS4 几乎一致（HTTP 独有 `--auth-basic`；SOCKS4 无 `--pass`，USERID 仅作标识）：
+HTTP、SOCKS5、SOCKS4 几乎一致（HTTP 独有 `--auth-basic` 与 `--parent`；SOCKS5 也支持 `--parent`；SOCKS4 无 `--pass`，USERID 仅作标识，且不支持上级代理）：
 
 | 短选项 | 长选项 | 说明 |
 | --- | --- | --- |
@@ -29,6 +29,7 @@ HTTP、SOCKS5、SOCKS4 几乎一致（HTTP 独有 `--auth-basic`；SOCKS4 无 `-
 | `-c <path>` | `--config` | TOML 配置文件路径；未指定时若 CWD 存在 `proxy.toml` 则自动加载 |
 | `-f <fmt>` | `--log-format` | `text\|json`（默认 `text`） |
 |  | `--log-level` | `debug\|info\|warn\|error`（默认 `info`） |
+|  | `--parent <url>` | 上级代理（HTTP / SOCKS5，issue #27）：`http://[user:pass@]host:port` 或 `socks5://[user:pass@]host:port`；环境变量 `PROXY_PARENT` / `SOCKS5_PARENT` |
 | `-h` | `--help` | 打印 usage（不加载配置文件） |
 | `-v` | `--version` | 打印版本（不加载配置文件） |
 
@@ -57,6 +58,7 @@ auth = { user = "alice", password = "secret" }
 log = { level = "info", format = "text" }
 metrics_addr = "127.0.0.1:9090"
 idle_timeout_seconds = 300
+parent = "socks5://user:pass@127.0.0.1:1080"
 
 [rules]
 allow = ["*.example.com", "10.0.0.0/8"]
