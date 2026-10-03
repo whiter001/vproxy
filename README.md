@@ -69,6 +69,29 @@ curl -x http://127.0.0.1:5777 http://httpbin.org/ip
 | SOCKS4 / SOCKS4a | [`proxy/socks4/1/proxy.socks4.v`](proxy/socks4/1/proxy.socks4.v) | `:5779` |
 | mproxy（XOR 隧道，**非真加密**） | [`proxy/mproxy/1/mproxy.serve.v`](proxy/mproxy/1/mproxy.serve.v) | `:8080` |
 
+## 作为 V 模块安装（VPM）
+
+仓库已发布到 VPM（V 包管理器），供需要把代理能力**嵌入自己 V 程序**的开发者使用：
+
+```bash
+v install whiter001.vproxy
+```
+
+可复用的模块（import 路径形如 `vproxy.proxy.vpcli`）：
+
+| 模块 | 用途 |
+| --- | --- |
+| `vproxy.proxy.vpcli` | 命令行/环境变量配置解析、proxy.toml `[rules]` 黑白名单加载 |
+| `vproxy.proxy.policy` | 目标域名 / 客户端 IP 黑白名单匹配（issue #30） |
+| `vproxy.proxy.upstream` | 上级代理级联拨号，HTTP CONNECT / SOCKS5（issue #27） |
+| `vproxy.proxy.lifecycle` | 优雅退出、pid 文件、信号处理 |
+| `vproxy.proxy.mproxy.xor` | XOR 变换（**非真加密**） |
+| `vproxy.proxy.mproxy.socks5_dial` | 经 SOCKS5 上级建立 TCP 连接 |
+
+> 注意：`proxy/*/1/` 下的入口是 `module main` 应用（目录名 `1` 为纯数字，不可 import），
+> 不能作为库被引用。**日常部署代理请直接使用 [GitHub Releases](../../releases) 的预编译二进制**，
+> 每次 main 分支更新自动发版；VPM 模块仅面向嵌入式开发场景。
+
 ## 文档
 
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — HTTP / SOCKS5 / SOCKS4a 协议支持矩阵（覆盖与不覆盖的 RFC）
