@@ -82,8 +82,13 @@ fn parse_args(args []string) !Config {
 	version := fp.bool_opt('version', `v`, 'show version and exit', flag.FlagConfig{}) or { false }
 	fp.finalize() or { return error(err.msg()) }
 
-	final_listen := if listen != '' { listen } else { os.getenv_opt('MPROXY_LISTEN_ADDR') or {
-			default_listen} }
+	final_listen := if listen != '' {
+		listen
+	} else {
+		os.getenv_opt('MPROXY_LISTEN_ADDR') or {
+			default_listen
+		}
+	}
 	final_remote := if remote != '' { remote } else { os.getenv_opt('MPROXY_REMOTE') or { '' } }
 
 	mut idle_dur := time.Duration(300) * time.second
