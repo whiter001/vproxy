@@ -264,7 +264,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, upstream_cfg socks5_dial.
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		secs := f64(duration) / 1e9
+		eprintln('Client handled in ${secs}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	header_bytes, mut pending_body := read_xor_request_head(mut socket) or {

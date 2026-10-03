@@ -22,9 +22,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install V
-        uses: vlang/setup-v@v1.4
-        with:
-          check-latest: true
+        shell: bash
+        run: bash scripts/install_v.sh
 
       # 外网烟测：httpbin.org 不可达时 REQUIRE_NET=1 硬失败（烟测语义）
       - name: Real-network smoke test (httpbin.org)
@@ -43,9 +42,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install V
-        uses: vlang/setup-v@v1.4
-        with:
-          check-latest: true
+        shell: bash
+        run: bash scripts/install_v.sh
 
       - name: Install wrk
         run: |

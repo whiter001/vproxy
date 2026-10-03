@@ -17,7 +17,7 @@
 2. **单元测试**：
 
    ```bash
-   v test proxy/http/1 proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle
+   v test proxy/httpsrv proxy/socks5srv proxy/mproxy/xor proxy/mproxy/socks5_dial proxy/lifecycle proxy/vpcli proxy/policy proxy/upstream
    ```
 
 3. **本地集成测试**（无外网依赖）：
@@ -46,3 +46,14 @@
 - 不引入未在 CI 矩阵（linux / darwin / windows）验证的依赖。
 - 改协议行为前，先更新对应 `1/README.md` 与 `docs/PROTOCOL.md` 的协议矩阵。
 - mproxy 的 XOR 不是加密，文档需如实标注。
+
+## V 版本策略（CI 双版本）
+
+- **build / test job**：`scripts/install_v.sh` 安装 **V 0.5.2 预编译包**（固定版本、可复现；
+  windows runner 无法从源码 bootstrap，见 issue #12）。
+- **format job**：`vlang/setup-v` 跟踪 **V master**，fmt 门禁需与本地开发（master）的
+  fmt 输出一致（两版本 fmt 对部分长行换行策略不同）。
+- 因此代码必须同时满足：**0.5.2 release 可编译** + **master fmt 输出稳定**。不要使用
+  0.5.2 之后才进 master 的语言特性（如字符串插值内的 `:.3f` 格式说明符、插值表达式里
+  写 `1e9` 字面量）；违反时 CI 的 0.5.2 build job 会拦下。
+- 本地验证 0.5.2 兼容性：`bash scripts/install_v.sh` 后用其安装的 v 编译入口文件。
