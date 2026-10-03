@@ -61,6 +61,14 @@ pub fn serve(listen_addr string, expected_user string, expected_pass string, idl
 	eprintln('SOCKS5 proxy listening on ${listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
+	// Option 跨 go 边界会触发 V 0.5.2 C codegen bug（_option 类型在 thread-arg
+	// 结构体中声明不全，issue #12），在循环外解包为值 + 标志，循环内按值传递。
+	mut parent_val := upx.Parent{}
+	mut has_parent := false
+	if p := parent {
+		parent_val = p
+		has_parent = true
+	}
 	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
 	server.set_accept_timeout(1 * time.second)
 
@@ -82,7 +90,7 @@ pub fn serve(listen_addr string, expected_user string, expected_pass string, idl
 		stdatomic.add_i64(&stats.active_conns, 1)
 		stats.inflight.add(1)
 		go handle_client_ver(mut socket, stats, idle_dur, expected_user, expected_pass, rules,
-			parent, relay_host, none)
+			parent_val, has_parent, relay_host, 0)
 	}
 
 	active := stdatomic.load_i64(&stats.active_conns)
@@ -94,7 +102,7 @@ pub fn serve(listen_addr string, expected_user string, expected_pass string, idl
 }
 
 pub fn handle_client_ver(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, expected_user string,
-	expected_pass string, rules policy.Rules, parent ?upx.Parent, relay_host string, ver_already_read ?u8) {
+	expected_pass string, rules policy.Rules, parent upx.Parent, has_parent bool, relay_host string, ver_already_read u8) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -104,7 +112,8 @@ pub fn handle_client_ver(mut socket net.TcpConn, stats &Stats, idle_dur time.Dur
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		secs := f64(duration) / 1e9
+		eprintln('Client handled in ${secs}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	// 客户端 IP 黑白名单（issue #30）
@@ -118,15 +127,18 @@ pub fn handle_client_ver(mut socket net.TcpConn, stats &Stats, idle_dur time.Dur
 		return
 	}
 
-	handle_request(mut socket, idle_dur, rules, parent, relay_host)
+	// parent 按值传入（go 边界的 Option 会触发 V 0.5.2 C codegen bug，见 serve），
+	// 下游常规调用用 Option 语义，这里重新包装。
+	parent_opt := if has_parent { ?upx.Parent(parent) } else { ?upx.Parent(none) }
+	handle_request(mut socket, idle_dur, rules, parent_opt, relay_host)
 }
 
-fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string, ver_already_read ?u8) bool {
+fn handle_greeting_and_auth(mut socket net.TcpConn, expected_user string, expected_pass string, ver_already_read u8) bool {
 	mut greeting := []u8{len: 2}
-	if v := ver_already_read {
-		// 单端口多协议前置（issue #29）：VER 字节已被预读时直接使用，
-		// 只补读 NMETHODS 与 METHODS。
-		greeting[0] = v
+	if ver_already_read != 0 {
+		// 单端口多协议前置（issue #29）：VER 字节已被预读时直接使用（0 为哨兵，
+		// 0x00 不是合法 SOCKS 版本号），只补读 NMETHODS 与 METHODS。
+		greeting[0] = ver_already_read
 		read_exact(mut socket, mut greeting[1..]) or {
 			eprintln('Failed to read greeting: ${err}')
 			return false

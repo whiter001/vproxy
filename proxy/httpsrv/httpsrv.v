@@ -42,6 +42,14 @@ pub fn serve(listen_addr string, expected_auth string, require_auth bool, idle_d
 	eprintln('Listen on ${listen_addr} (idle_timeout=${idle_dur}) ...')
 
 	stats := &Stats{}
+	// Option 跨 go 边界会触发 V 0.5.2 C codegen bug（_option 类型在 thread-arg
+	// 结构体中声明不全，issue #12），在循环外解包为值 + 标志，循环内按值传递。
+	mut parent_val := upx.Parent{}
+	mut has_parent := false
+	if p := parent {
+		parent_val = p
+		has_parent = true
+	}
 	// 周期性检查停止标志；不设超时则 SIGTERM 后 accept() 永远阻塞。
 	server.set_accept_timeout(1 * time.second)
 	for {
@@ -65,7 +73,8 @@ pub fn serve(listen_addr string, expected_auth string, require_auth bool, idle_d
 		}
 		stdatomic.add_i64(&stats.active_conns, 1) // 原子计数器
 		stats.inflight.add(1)
-		go handle_client_preface(mut socket, stats, expected_auth, require_auth, idle_dur, rules, parent, [])
+		go handle_client_preface(mut socket, stats, expected_auth, require_auth, idle_dur, rules,
+			parent_val, has_parent, [])
 	}
 
 	// 等所有 in-flight handle_client 退出后 main 返回，进程退出码 0
@@ -112,7 +121,7 @@ pub fn proxy_auth_config(auth_basic string, user string, pass string, require_au
 //    idle timeout / 客户端关闭 / 错误响应（Connection: close）。
 // 7. issue #30：accept 后先做客户端 IP 黑白名单判定，拒绝则直接关闭。
 pub fn handle_client_preface(mut socket net.TcpConn, stats &Stats, expected_auth string, require_auth bool,
-	idle_dur time.Duration, rules policy.Rules, parent ?upx.Parent, preface []u8) {
+	idle_dur time.Duration, rules policy.Rules, parent upx.Parent, has_parent bool, preface []u8) {
 	lifecycle.apply_idle_timeout(mut socket, idle_dur)
 	start := time.now()
 	defer {
@@ -122,7 +131,8 @@ pub fn handle_client_preface(mut socket net.TcpConn, stats &Stats, expected_auth
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		secs := f64(duration) / 1e9
+		eprintln('Client handled in ${secs}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	// 客户端 IP 黑白名单（issue #30）：两表皆空时 client_allowed 恒真，零开销路径。
@@ -134,13 +144,17 @@ pub fn handle_client_preface(mut socket net.TcpConn, stats &Stats, expected_auth
 
 	// keep-alive 循环：process_request 返回 true 表示连接可复用。
 	// 注意：首请求前读到空连接（EOF）会返回 400；已处理过请求后再 EOF 属正常关闭，静默结束。
+	// parent 按值传入（go 边界的 Option 会触发 V 0.5.2 C codegen bug，见 serve），
+	// 下游常规调用用 Option 语义，这里重新包装。
+	parent_opt := if has_parent { ?upx.Parent(parent) } else { ?upx.Parent(none) }
 	mut first_request := true
 	// 上一轮 read_request_head 多读的字节（可能含流水线/背靠背的下一请求、或 CL body
 	// 超出部分），作为下一轮读取的初始缓冲，避免被静默丢弃。
-	mut carry_body := preface
+	// preface 为调用方预读的字节（sps 嗅探），clone 出独立可变缓冲。
+	mut carry_body := preface.clone()
 	for {
 		keep_alive := process_request(mut socket, expected_auth, require_auth, idle_dur, first_request, mut
-			carry_body, rules, parent) or { break }
+			carry_body, rules, parent_opt) or { break }
 		first_request = false
 		if !keep_alive {
 			break

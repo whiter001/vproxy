@@ -135,7 +135,8 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, expected_user string, ski
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		secs := f64(duration) / 1e9
+		eprintln('Client handled in ${secs}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	// 客户端 IP 黑白名单（issue #30）
