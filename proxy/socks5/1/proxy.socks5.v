@@ -134,7 +134,7 @@ fn handle_client(mut socket net.TcpConn, stats &Stats, idle_dur time.Duration, e
 	}
 	defer {
 		duration := time.since(start)
-		eprintln('Client handled in ${duration}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
+		eprintln('Client handled in ${f64(duration) / 1e9:.3f}s. Active: ${stdatomic.load_i64(&stats.active_conns)}')
 	}
 
 	if !handle_greeting_and_auth(mut socket, expected_user, expected_pass) {
