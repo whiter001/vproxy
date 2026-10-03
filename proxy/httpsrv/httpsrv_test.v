@@ -1,4 +1,4 @@
-module main
+module httpsrv
 
 import encoding.base64
 
